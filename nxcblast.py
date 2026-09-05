@@ -1115,20 +1115,19 @@ def pastables_for_hit(hit: Hit) -> list[str]:
     low_priv = cred.kind in {"null", "guest", "user-only"}
 
     if proto == "smb":
+        lines.append(
+            _nxc_cmd(
+                "smb",
+                t,
+                nxc_auth,
+                local,
+                "--users --shares --pass-pol --rid-brute 10000",
+            )
+        )
+        if not low_priv:
+            lines.append(_nxc_cmd("smb", t, nxc_auth, local, "--sam"))
         if kind == "hash":
-            lines += [
-                _nxc_cmd("smb", t, nxc_auth, local),
-                _nxc_cmd("smb", t, nxc_auth, local, "--shares"),
-                f"impacket-secretsdump {cred.username}@{t} -hashes {h}",
-            ]
-        else:
-            lines += [
-                _nxc_cmd("smb", t, nxc_auth, local, "--shares"),
-            ]
-            if not local:
-                lines.append(_nxc_cmd("smb", t, nxc_auth, local, "--rid-brute"))
-            if not low_priv:
-                lines.append(_nxc_cmd("smb", t, nxc_auth, local, "--sam"))
+            lines.append(f"impacket-secretsdump {cred.username}@{t} -hashes {h}")
     elif proto == "winrm":
         if kind == "hash":
             lines += [
@@ -1152,9 +1151,7 @@ def pastables_for_hit(hit: Hit) -> list[str]:
         if kind != "hash":
             lines.append(_nxc_cmd("ftp", t, nxc_auth, False, "--ls"))
     elif proto == "ldap":
-        lines.append(_nxc_cmd("ldap", t, nxc_auth, False))
-        if kind != "hash":
-            lines.append(_nxc_cmd("ldap", t, nxc_auth, False, "--users"))
+        lines.append(_nxc_cmd("ldap", t, nxc_auth, False, "--groups --computers"))
     elif proto == "mssql":
         lines.append(_nxc_cmd("mssql", t, nxc_auth, local))
         if kind != "hash":

