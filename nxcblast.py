@@ -366,6 +366,34 @@ def split_target_token(token: str) -> list[str]:
     return [part.strip() for part in token.split(",") if part.strip()]
 
 
+def split_auth_values(
+    raws: Optional[list[str] | str], *, keep_blank: bool = False
+) -> list[str]:
+    """Flatten space-separated CLI values and comma-separated tokens.
+
+    Same shape as targets: `-u Admin Administrator` and `-u Admin,Administrator`.
+    Blank tokens are dropped unless keep_blank (so `-p ''` stays an empty password).
+    """
+    if raws is None:
+        return []
+    if isinstance(raws, str):
+        raws = [raws]
+    out: list[str] = []
+    for raw in raws:
+        if "," in raw:
+            for part in raw.split(","):
+                part = part.strip()
+                if part or keep_blank:
+                    out.append(part)
+        else:
+            stripped = raw.strip()
+            if stripped:
+                out.append(stripped)
+            elif keep_blank:
+                out.append(raw)
+    return out
+
+
 def expand_one_target(token: str) -> list[str]:
     token = token.strip()
     if not token:
@@ -602,21 +630,20 @@ def build_credentials(args: argparse.Namespace) -> list[Credential]:
             creds.append(cred)
 
     users: list[tuple[str, str]] = []  # (domain, username)
-    if args.u:
-        users.append(parse_user(args.u))
+    for raw in split_auth_values(args.u):
+        users.append(parse_user(raw))
     if args.U:
         for line in read_lines(args.U):
             users.append(parse_user(line))
 
     passwords: list[str] = []
     if args.p is not None:
-        passwords.append(args.p)
+        passwords.extend(split_auth_values(args.p, keep_blank=True))
     if args.P:
         passwords.extend(read_lines(args.P))
 
     hashes: list[str] = []
-    if args.H:
-        hashes.append(args.H)
+    hashes.extend(split_auth_values(args.H))
 
     for domain, user in users:
         for password in passwords:
@@ -1082,6 +1109,14 @@ def _nxc_cmd(proto: str, target: str, nxc_auth: str, local: bool, suffix: str = 
     return f"nxc {proto} {target} {nxc_auth}{local_flag}{extra}".rstrip()
 
 
+def hit_has_exec(hit: Hit) -> bool:
+    """True when nxc reported admin/exec (Pwn3d! or Shell), not merely valid creds."""
+    if hit.protocol == "ftp":
+        return False
+    low = (hit.status or "").lower()
+    return "pwn3d" in low or "shell" in low
+
+
 def _rdp_pastable(hit: Hit) -> str:
     cred = hit.cred
     t = hit.target
@@ -1113,6 +1148,7 @@ def pastables_for_hit(hit: Hit) -> list[str]:
     lines: list[str] = []
 
     low_priv = cred.kind in {"null", "guest", "user-only"}
+    can_exec = hit_has_exec(hit) and not low_priv
 
     if proto == "smb":
         lines.append(
@@ -1124,21 +1160,22 @@ def pastables_for_hit(hit: Hit) -> list[str]:
                 "--users --shares --pass-pol --rid-brute 10000",
             )
         )
-        if not low_priv:
+        if can_exec:
             lines.append(_nxc_cmd("smb", t, nxc_auth, local, "--sam"))
-        if kind == "hash":
-            lines.append(f"impacket-secretsdump {cred.username}@{t} -hashes {h}")
+            if kind == "hash":
+                lines.append(f"impacket-secretsdump {cred.username}@{t} -hashes {h}")
     elif proto == "winrm":
-        if kind == "hash":
-            lines += [
-                f"evil-winrm -i {t} -u {u} -H {nth}",
-                _nxc_cmd("winrm", t, nxc_auth, local),
-            ]
-        else:
-            lines += [
-                f"evil-winrm -i {t} -u {u} -p {p}",
-                _nxc_cmd("winrm", t, nxc_auth, local, "-x whoami"),
-            ]
+        if can_exec:
+            if kind == "hash":
+                lines += [
+                    f"evil-winrm -i {t} -u {u} -H {nth}",
+                    _nxc_cmd("winrm", t, nxc_auth, local, "-x whoami"),
+                ]
+            else:
+                lines += [
+                    f"evil-winrm -i {t} -u {u} -p {p}",
+                    _nxc_cmd("winrm", t, nxc_auth, local, "-x whoami"),
+                ]
     elif proto == "rdp":
         lines.append(_rdp_pastable(hit))
     elif proto == "ssh":
@@ -1154,13 +1191,14 @@ def pastables_for_hit(hit: Hit) -> list[str]:
         lines.append(_nxc_cmd("ldap", t, nxc_auth, False, "--groups --computers"))
     elif proto == "mssql":
         lines.append(_nxc_cmd("mssql", t, nxc_auth, local))
-        if kind != "hash":
+        if can_exec and kind != "hash":
             lines.append(_nxc_cmd("mssql", t, nxc_auth, local, "-x whoami"))
     elif proto == "vnc":
         if kind != "hash":
             lines.append(_nxc_cmd("vnc", t, nxc_auth, False))
     elif proto == "wmi":
-        lines.append(_nxc_cmd("wmi", t, nxc_auth, local, "-x whoami"))
+        if can_exec:
+            lines.append(_nxc_cmd("wmi", t, nxc_auth, local, "-x whoami"))
 
     seen: set[str] = set()
     uniq: list[str] = []
@@ -1175,12 +1213,6 @@ def render_pastables(hits: list[Hit]) -> str:
     if not hits:
         return ""
     bar = "=" * 60
-    chunks = [
-        bar,
-        "PASTABLES -- confirmed hits, suggested follow-up commands",
-        bar,
-        "",
-    ]
 
     groups: dict[tuple[str, str], list[Hit]] = {}
     order: list[tuple[str, str]] = []
@@ -1191,11 +1223,11 @@ def render_pastables(hits: list[Hit]) -> str:
             order.append(key)
         groups[key].append(hit)
 
+    blocks: list[str] = []
     for key in order:
         group = groups[key]
         target, cred_disp = key
-        chunks.append(f"[{target} | {cred_disp}]")
-        chunks.append("")
+        body: list[str] = []
         by_proto: dict[str, list[Hit]] = {}
         proto_order: list[str] = []
         for hit in group:
@@ -1213,17 +1245,32 @@ def render_pastables(hits: list[Hit]) -> str:
                     mode_order.append(mode)
                 mode_groups[mode].append(hit)
             for mode in mode_order:
-                title = f"[{proto.upper()} {mode}]" if mode else f"[{proto.upper()}]"
-                chunks.append(title)
                 seen_cmd: set[str] = set()
+                cmds: list[str] = []
                 for hit in mode_groups[mode]:
                     for cmd in pastables_for_hit(hit):
                         if cmd not in seen_cmd:
                             seen_cmd.add(cmd)
-                            chunks.append(f"  {cmd}")
-                chunks.append("")
-    chunks.append(bar)
-    return "\n".join(chunks)
+                            cmds.append(cmd)
+                if not cmds:
+                    continue
+                title = f"[{proto.upper()} {mode}]" if mode else f"[{proto.upper()}]"
+                body.append(title)
+                for cmd in cmds:
+                    body.append(f"  {cmd}")
+                body.append("")
+        if not body:
+            continue
+        blocks.append(f"[{target} | {cred_disp}]")
+        blocks.append("")
+        blocks.extend(body)
+    if not blocks:
+        return ""
+    return "\n".join(
+        [bar, "PASTABLES -- confirmed hits, suggested follow-up commands", bar, ""]
+        + blocks
+        + [bar]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1368,6 +1415,8 @@ examples:
   nxcblast smb,winrm targets.txt -u admin -p Password1
   nxcblast 192.168.1.10 192.168.1.11 -u admin -p Password1
   nxcblast 192.168.1.10,192.168.1.11 -u admin -p Password1
+  nxcblast 192.168.1.10 -u Admin Administrator -p Password1
+  nxcblast smb targets.txt -u admin,backup -p 'Summer2026!' 'Winter2026!'
   nxcblast targets.txt -u admin -p Password1
   nxcblast smb rdp 10.10.10.5 -u admin -H aad3b435b51404eeaad3b435b51404ee:DEADBEEF
   nxcblast all 192.168.1.0/24 --null --guest
@@ -1407,11 +1456,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     auth = p.add_argument_group("auth")
-    auth.add_argument("-u", metavar="USER", default="", help="single username")
+    auth.add_argument(
+        "-u",
+        nargs="+",
+        metavar="USER",
+        default=None,
+        help="username(s): space-separated, comma-separated, or mixed",
+    )
     auth.add_argument("-U", metavar="FILE", default="", help="file of usernames")
-    auth.add_argument("-p", metavar="PASSWORD", default=None, help="single password")
+    auth.add_argument(
+        "-p",
+        nargs="+",
+        metavar="PASSWORD",
+        default=None,
+        help="password(s): space-separated, comma-separated, or mixed",
+    )
     auth.add_argument("-P", metavar="FILE", default="", help="file of passwords")
-    auth.add_argument("-H", metavar="HASH", default="", help="NTLM hash (pass-the-hash)")
+    auth.add_argument(
+        "-H",
+        nargs="+",
+        metavar="HASH",
+        default=None,
+        help="NTLM hash(es) (pass-the-hash): space-separated, comma-separated, or mixed",
+    )
     auth.add_argument(
         "--creds",
         metavar="FILE",
