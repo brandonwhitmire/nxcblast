@@ -261,6 +261,11 @@ class Job:
             return f"{self.protocol} {mode}"
         return self.protocol
 
+    def progress_label(self) -> str:
+        """Bottom bar: IP:PROTO:CREDS:METHOD."""
+        method = method_letter(self.auth_mode())
+        return f"{self.target}:{self.protocol.upper()}:{self.cred.display}:{method}"
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -417,6 +422,43 @@ def split_auth_values(
     return out
 
 
+def resolve_auth_values(
+    raws: Optional[list[str] | str], *, keep_blank: bool = False
+) -> list[str]:
+    """Like split_auth_values, but a token that is a file expands to its lines.
+
+    Matches nxc: `-u users.txt` / `-p passwords.txt` / `-H hashes.txt` read the
+    file instead of treating the filename as a literal secret.
+    """
+    out: list[str] = []
+    for token in split_auth_values(raws, keep_blank=keep_blank):
+        if token and Path(token).is_file():
+            lines = read_lines(token)
+            if not lines:
+                die(f"auth file is empty: {token}")
+            out.extend(lines)
+        else:
+            if token and _looks_like_missing_auth_file(token):
+                print(
+                    c_warn(
+                        f"{token} looks like a file but was not found; "
+                        "using as a literal"
+                    ),
+                    file=sys.stderr,
+                )
+            out.append(token)
+    return out
+
+
+def _looks_like_missing_auth_file(token: str) -> bool:
+    if Path(token).is_file():
+        return False
+    base = Path(token).name
+    if "/" in token or token.startswith("./"):
+        return True
+    return base.endswith((".txt", ".lst", ".list", ".csv"))
+
+
 def expand_one_target(token: str) -> list[str]:
     token = token.strip()
     if not token:
@@ -505,6 +547,46 @@ def load_creds_file(path: str) -> list[Credential]:
             continue
         creds.append(cred)
     return creds
+
+
+def _cartesian_creds(user_file: str, secret_file: str) -> list[Credential]:
+    users = [parse_user(line) for line in read_lines(user_file)]
+    secrets = read_lines(secret_file)
+    if not users:
+        die(f"user file is empty: {user_file}")
+    if not secrets:
+        die(f"secret file is empty: {secret_file}")
+    creds: list[Credential] = []
+    for domain, user in users:
+        if not user:
+            continue
+        for secret in secrets:
+            if looks_like_hash(secret):
+                creds.append(
+                    Credential(
+                        username=user, ntlm_hash=secret, domain=domain, kind="hash"
+                    )
+                )
+            else:
+                creds.append(
+                    Credential(
+                        username=user, password=secret, domain=domain, kind="password"
+                    )
+                )
+    if not creds:
+        die(f"no credentials from {user_file}:{secret_file}")
+    return creds
+
+
+def load_creds_spec(spec: str) -> list[Credential]:
+    """Load `--creds`: a user:pass file, or `users.txt:passwords.txt` if both exist."""
+    if Path(spec).is_file():
+        return load_creds_file(spec)
+    if ":" in spec:
+        left, right = spec.split(":", 1)
+        if Path(left).is_file() and Path(right).is_file():
+            return _cartesian_creds(left, right)
+    return load_creds_file(spec)
 
 
 def load_nxcdb() -> list[Credential]:
@@ -653,7 +735,7 @@ def build_credentials(args: argparse.Namespace) -> list[Credential]:
             creds.append(cred)
 
     users: list[tuple[str, str]] = []  # (domain, username)
-    for raw in split_auth_values(args.u):
+    for raw in resolve_auth_values(args.u):
         users.append(parse_user(raw))
     if args.U:
         for line in read_lines(args.U):
@@ -661,12 +743,12 @@ def build_credentials(args: argparse.Namespace) -> list[Credential]:
 
     passwords: list[str] = []
     if args.p is not None:
-        passwords.extend(split_auth_values(args.p, keep_blank=True))
+        passwords.extend(resolve_auth_values(args.p, keep_blank=True))
     if args.P:
         passwords.extend(read_lines(args.P))
 
     hashes: list[str] = []
-    hashes.extend(split_auth_values(args.H))
+    hashes.extend(resolve_auth_values(args.H))
 
     for domain, user in users:
         for password in passwords:
@@ -688,7 +770,7 @@ def build_credentials(args: argparse.Namespace) -> list[Credential]:
             )
 
     if args.creds:
-        for cred in load_creds_file(args.creds):
+        for cred in load_creds_spec(args.creds):
             add(cred)
 
     if args.nxcdb:
@@ -1021,47 +1103,142 @@ class LockoutTracker:
 
 _progress_lock = threading.Lock()
 _progress_len = 0
-_dots_on_line = False
+_progress_msg = ""
+_dots_count = 0
+_dots_max = 0
+_below_dots = 0
+_last_hit_target: Optional[str] = None
 _quiet = False
 _log_fh: Optional[TextIO] = None
 _log_lock = threading.Lock()
 
 
+def _dots_live() -> bool:
+    return (not _quiet) and sys.stdout.isatty()
+
+
+def _progress_live() -> bool:
+    return (not _quiet) and sys.stderr.isatty()
+
+
 def _clear_progress() -> None:
     global _progress_len
-    if _quiet or _progress_len <= 0:
+    if _progress_len <= 0:
         return
     sys.stderr.write("\r" + " " * _progress_len + "\r")
     sys.stderr.flush()
     _progress_len = 0
 
 
-def _break_dot_line() -> None:
-    """End the current `.` attempt line. Caller must hold `_progress_lock`."""
-    global _dots_on_line
-    if _dots_on_line:
-        sys.stdout.write("\n")
-        sys.stdout.flush()
-        _dots_on_line = False
+def _draw_progress(msg: str) -> None:
+    """Write the bottom progress bar. Caller must hold `_progress_lock`."""
+    global _progress_len
+    if not _progress_live():
+        return
+    text = f"{C.dim}[*] {msg}{C.reset}"
+    pad = max(0, _progress_len - len(strip_ansi(text)))
+    sys.stderr.write("\r" + text + (" " * pad))
+    sys.stderr.flush()
+    _progress_len = len(strip_ansi(text))
+
+
+def _progress_bar(done: int, total: int, width: int = 16) -> str:
+    if total <= 0:
+        frac = 1.0
+    else:
+        frac = min(max(done / total, 0.0), 1.0)
+    filled = int(width * frac)
+    if filled > width:
+        filled = width
+    return "[" + "#" * filled + "-" * (width - filled) + "]"
+
+
+def show_progress(msg: str) -> None:
+    global _progress_msg
+    if not _progress_live():
+        return
+    with _progress_lock:
+        _progress_msg = msg
+        _draw_progress(msg)
+
+
+def _restore_progress() -> None:
+    """Redraw the bottom bar after stdout output. Caller holds `_progress_lock`."""
+    if _progress_msg:
+        _draw_progress(_progress_msg)
+
+
+def _note_output_lines(n: int) -> None:
+    global _below_dots
+    if _dots_live() and n > 0:
+        _below_dots += n
+
+
+def start_hit_table() -> None:
+    """Print the hit header and reserve one line under it for progress dots."""
+    global _below_dots, _dots_count, _dots_max, _last_hit_target
+    _last_hit_target = None
+    _dots_count = 0
+    print(flush=True)
+    print(hit_column_header(), flush=True)
+    print(flush=True)
+    if _dots_live():
+        _dots_max = max(8, shutil.get_terminal_size((80, 24)).columns - 1)
+        _below_dots = 1
+    else:
+        _dots_max = 0
+        _below_dots = 0
+
+
+def _write_dot() -> None:
+    """Append `.` on the reserved top line. Caller holds `_progress_lock`."""
+    global _dots_count
+    if not _dots_live() or _below_dots < 1:
+        return
+    if _dots_count >= _dots_max:
+        return
+    rows = shutil.get_terminal_size((80, 24)).lines
+    if _below_dots >= max(2, rows - 2):
+        return
+    up = _below_dots
+    sys.stdout.write(f"\033[{up}A")
+    sys.stdout.write(f"\033[{_dots_count + 1}G")
+    sys.stdout.write(".")
+    _dots_count += 1
+    sys.stdout.write(f"\033[{up}B")
+    sys.stdout.write("\r")
+    sys.stdout.flush()
 
 
 def mark_attempt_done() -> None:
-    """Print a `.` for a finished nxc call. Stays on one line until a hit/status."""
-    global _dots_on_line
+    """Add a `.` on the top line for a finished nxc call."""
     if _quiet:
         return
     with _progress_lock:
         _clear_progress()
-        sys.stdout.write(".")
-        sys.stdout.flush()
-        _dots_on_line = True
+        _write_dot()
+        _restore_progress()
 
 
 def emit(msg: str) -> None:
+    global _last_hit_target
     with _progress_lock:
         _clear_progress()
-        _break_dot_line()
         print(msg, flush=True)
+        _last_hit_target = None
+        _note_output_lines(str(msg).count("\n") + 1)
+        _restore_progress()
+
+
+def emit_hit(hit: Hit) -> None:
+    global _last_hit_target
+    with _progress_lock:
+        _clear_progress()
+        show_target = _last_hit_target != hit.target
+        _last_hit_target = hit.target
+        print(format_hit_line(hit, show_target=show_target), flush=True)
+        _note_output_lines(1)
+        _restore_progress()
 
 
 def log_write(text: str) -> None:
@@ -1263,14 +1440,15 @@ def pastables_for_hit(hit: Hit) -> list[str]:
                 t,
                 nxc_auth,
                 local,
-                "--users --shares --pass-pol --rid-brute 10000",
+                "--users --shares --pass-pol --rid-brute 10000 "
+                "--reg-sessions --loggedon-users --qwinsta --smb-sessions",
             )
         )
         if can_exec:
             spec, extra = _impacket_spec(cred, t, local)
             lines.append(_nxc_cmd("smb", t, nxc_auth, local, "--sam --lsa"))
-            for mod in SMB_DUMP_MODULES:
-                lines.append(_nxc_cmd("smb", t, nxc_auth, local, f"-M {mod}"))
+            dump_mods = " ".join(f"-M {mod}" for mod in SMB_DUMP_MODULES)
+            lines.append(_nxc_cmd("smb", t, nxc_auth, local, dump_mods))
             lines.append(_nxc_cmd("smb", t, nxc_auth, local, "-x whoami"))
             lines.append(f"impacket-smbexec {spec}{extra}")
     elif proto == "winrm":
@@ -1494,9 +1672,8 @@ def group_jobs_by_lane(jobs: list[Job]) -> list[tuple[tuple[str, str], list[Job]
     return [(k, lanes[k]) for k in order]
 
 
+HIT_COL_TARGET = 28
 HIT_COL_PROTO = 6
-HIT_COL_TARGET = 16
-HIT_COL_HOST = 16
 HIT_COL_CREDS = 22
 HIT_COL_METHOD = 6
 
@@ -1532,28 +1709,30 @@ def format_hit_status(hit: Hit) -> str:
     return f"{C.green}({inner}){C.reset}"
 
 
+def hit_target_label(hit: Hit) -> str:
+    if hit.hostname:
+        return f"{hit.target}:{hit.hostname}"
+    return hit.target
+
+
 def hit_column_header() -> str:
-    proto = "PROTO".ljust(HIT_COL_PROTO)
     target = "TARGET".ljust(HIT_COL_TARGET)
-    host = "HOSTNAME".ljust(HIT_COL_HOST)
+    proto = "PROTO".ljust(HIT_COL_PROTO)
     creds = "CREDS".ljust(HIT_COL_CREDS)
     method = "METHOD".ljust(HIT_COL_METHOD)
-    return (
-        f"{C.dim}    {proto} | {target} | {host} | {creds} | {method} | ACCESS{C.reset}"
-    )
+    return f"{C.dim}    {target} | {proto} | {creds} | {method} | ACCESS{C.reset}"
 
 
-def format_hit_line(hit: Hit) -> str:
+def format_hit_line(hit: Hit, show_target: bool = True) -> str:
+    target_raw = hit_target_label(hit) if show_target else ""
+    target = target_raw.ljust(HIT_COL_TARGET)
     proto = hit.protocol.upper().ljust(HIT_COL_PROTO)
-    target = hit.target.ljust(HIT_COL_TARGET)
-    host = (hit.hostname or "-").ljust(HIT_COL_HOST)
     cred = hit.cred.display.ljust(HIT_COL_CREDS)
     method = method_letter(hit.auth_mode).ljust(HIT_COL_METHOD)
     status = format_hit_status(hit)
     proto_s = f"{C.yellow}{proto}{C.reset}"
     return (
-        f"{C.green_bold}[+]{C.reset} {proto_s} | {target} | {host} | "
-        f"{cred} | {method} | {status}"
+        f"{C.green_bold}[+]{C.reset} {target} | {proto_s} | {cred} | {method} | {status}"
     )
 
 
@@ -1574,9 +1753,10 @@ examples:
   nxcblast smb 10.10.10.5 -u admin
   nxcblast smb 10.10.10.5
   nxcblast smb targets.txt -U users.txt -P passwords.txt --lockout 3 --lockout-delay 60
+  nxcblast smb targets.txt -u users.txt -p passwords.txt
   nxcblast winrm,smb targets.txt --creds creds.txt --nxcdb
   nxcblast mssql 10.10.10.20 -u sa -p sa --mssql-local
-  nxcblast smb 10.10.10.5 -u admin -p Password1 --local --stop-on-hit
+  nxcblast smb 10.10.10.5 -u admin -p Password1 --local-auth --stop-on-hit
   nxcblast targets.txt -u admin --user-only --null --guest --threads 8
   nxcblast smb targets.txt -u admin -p Password1 --verbose
   nxcblast smb targets.txt -u admin -p Password1 -- --users bob
@@ -1618,7 +1798,7 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         metavar="USER",
         default=None,
-        help="username(s): space-separated, comma-separated, or mixed",
+        help="username(s): space-separated, comma-separated, file, or mixed",
     )
     auth.add_argument("-U", metavar="FILE", default="", help="file of usernames")
     auth.add_argument(
@@ -1626,7 +1806,7 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         metavar="PASSWORD",
         default=None,
-        help="password(s): space-separated, comma-separated, or mixed",
+        help="password(s): space-separated, comma-separated, file, or mixed",
     )
     auth.add_argument("-P", metavar="FILE", default="", help="file of passwords")
     auth.add_argument(
@@ -1634,13 +1814,13 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         metavar="HASH",
         default=None,
-        help="NTLM hash(es) (pass-the-hash): space-separated, comma-separated, or mixed",
+        help="NTLM hash(es) (pass-the-hash): space-separated, comma-separated, file, or mixed",
     )
     auth.add_argument(
         "--creds",
         metavar="FILE",
         default="",
-        help="file of user:pass or user::hash pairs (one per line)",
+        help="file of user:pass or user::hash pairs, or users.txt:passwords.txt",
     )
     auth.add_argument(
         "--nxcdb",
@@ -1670,8 +1850,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="username only, empty password (default when -u/-U is given without a password)",
     )
     kinds.add_argument(
-        "--local",
+        "--local-auth",
         action="store_true",
+        dest="local",
         help="local auth (nxc --local-auth) on protocols that support it; also tried automatically for null/guest/user-only",
     )
 
@@ -1742,7 +1923,7 @@ def build_parser() -> argparse.ArgumentParser:
     out.add_argument(
         "--quiet",
         action="store_true",
-        help="suppress progress dots, show only hits",
+        help="suppress progress dots and status bar, show only hits",
     )
     log_level = out.add_mutually_exclusive_group()
     log_level.add_argument(
@@ -1847,6 +2028,9 @@ def run_spray(
     """
     hits: list[Hit] = []
     hits_lock = threading.Lock()
+    done = 0
+    done_lock = threading.Lock()
+    total = len(jobs)
     limiter = RateLimiter(args.delay)
     extra_nxc = nxc_passthrough(args)
     lanes = group_jobs_by_lane(jobs)
@@ -1854,6 +2038,14 @@ def run_spray(
         workers = max(1, len(lanes))
     else:
         workers = max(1, min(args.threads, len(lanes) or 1))
+
+    def bump_progress(job: Job) -> None:
+        nonlocal done
+        with done_lock:
+            done += 1
+            show_progress(
+                f"{_progress_bar(done, total)} {done}/{total} | {job.progress_label()}"
+            )
 
     def run_one(job: Job) -> list[Hit]:
         if lockout.shutdown.is_set():
@@ -1867,6 +2059,12 @@ def run_spray(
                 return []
             limiter.wait()
             argv = build_nxc_argv(nxc, job, extra_nxc)
+            with done_lock:
+                current = min(done + 1, total)
+            show_progress(
+                f"{_progress_bar(current, total)} {current}/{total} | "
+                f"{job.progress_label()}"
+            )
             stdout = run_nxc(argv)
             mark_attempt_done()
             log_write(
@@ -1893,21 +2091,27 @@ def run_spray(
             lockout.leave(job.target, job.cred)
 
     def run_lane(lane_jobs: list[Job]) -> None:
-        for job in lane_jobs:
+        for i, job in enumerate(lane_jobs):
             if lockout.shutdown.is_set():
+                bump_progress(job)
                 continue
             try:
                 found = run_one(job)
             except Exception as exc:
                 log_write(f"{utc_now()} | worker error: {exc}\n")
+                bump_progress(job)
                 continue
             if found:
                 with hits_lock:
                     hits.extend(found)
                 for hit in found:
-                    emit(format_hit_line(hit))
+                    emit_hit(hit)
                 if args.stop_on_hit:
+                    bump_progress(job)
+                    for skipped in lane_jobs[i + 1 :]:
+                        bump_progress(skipped)
                     return
+            bump_progress(job)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(run_lane, lane_jobs) for _, lane_jobs in lanes]
@@ -1948,7 +2152,7 @@ def install_sigint(lockout: LockoutTracker) -> Callable:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    global _quiet, _log_fh, _dots_on_line
+    global _quiet, _log_fh, _dots_count, _below_dots, _last_hit_target, _progress_msg
 
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
     parse_argv, nxc_extra = split_nxc_passthrough(raw_argv)
@@ -1958,7 +2162,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     args.nxc_extra = nxc_extra
 
     _quiet = bool(args.quiet)
-    _dots_on_line = False
+    _dots_count = 0
+    _below_dots = 0
+    _last_hit_target = None
+    _progress_msg = ""
 
     apply_default_auth(args)
 
@@ -2033,9 +2240,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
 
     if not args.quiet:
-        print()
-        print(hit_column_header(), flush=True)
-        print(flush=True)
+        start_hit_table()
 
     lockout = LockoutTracker(args.lockout, args.lockout_delay)
     prev_handler = install_sigint(lockout)
@@ -2048,7 +2253,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         signal.signal(signal.SIGINT, prev_handler)
         with _progress_lock:
             _clear_progress()
-            _break_dot_line()
+            _progress_msg = ""
 
     hits.sort(
         key=lambda h: (
